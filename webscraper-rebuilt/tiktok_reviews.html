@@ -1,0 +1,69 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+	<meta charset="UTF-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1.0">
+	<title>TK Reviews</title>
+	<link rel="stylesheet" href="tiktok_reviews.css">
+</head>
+<body>
+	<main class="tk-app">
+		<header class="tk-header">
+			<h1>TK Shop Reviews</h1>
+			<p>Fetch review data from the TikTok Shop product rating API.</p>
+		</header>
+
+		<section class="tk-section">
+			<label>Automatic capture</label>
+			<div class="tk-actions">
+				<button id="startCapture" type="button">Install Capture & Refresh</button>
+				<button id="readCapture" type="button">Read Captured Data</button>
+			</div>
+			<p id="pageStatus" class="tk-muted">Open the TikTok rating page, then install capture and refresh.</p>
+		</section>
+
+		<section class="tk-section tk-grid one-field">
+			<div>
+				<label for="pageCount">Pages to fetch</label>
+				<input id="pageCount" type="number" min="1" value="1">
+			</div>
+		</section>
+
+		<section class="tk-section">
+			<div class="tk-actions">
+				<button id="fetchReviews" type="button">Fetch Reviews</button>
+				<button id="downloadCsv" type="button" disabled>Download CSV</button>
+				<button id="clearData" type="button">Clear</button>
+			</div>
+			<progress id="progress" value="0" max="100"></progress>
+			<p id="status" class="tk-muted">Paste a review list API URL, then load total.</p>
+		</section>
+
+		<section class="tk-section">
+			<div class="tk-summary">
+				<span id="rowCount">0 rows</span>
+				<span id="nextCursor"></span>
+			</div>
+			<div class="tk-table-wrap">
+				<table>
+					<thead>
+						<tr>
+							<th>star</th>
+							<th>review_text</th>
+							<th>reply_text</th>
+							<th>reply_count</th>
+							<th>main_review_id</th>
+							<th>order_id</th>
+							<th>product_id</th>
+							<th>user_name</th>
+							<th>create_time</th>
+						</tr>
+					</thead>
+					<tbody id="previewBody"></tbody>
+				</table>
+			</div>
+		</section>
+	</main>
+	<script src="tiktok_reviews.js"></script>
+</body>
+</html>

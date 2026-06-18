@@ -1,0 +1,64 @@
+<!DOCTYPE html>
+<html lang="en" style="font-size:10px">
+<head>
+	<meta charset="UTF-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1.0">
+	<style>
+        html, body {
+            margin: 0;
+            height: 100%;
+        }
+        .ws-shell-tabs {
+            display: flex;
+            height: 42px;
+            border-bottom: 1px solid #c7eef2;
+            background: #e9fbfd;
+            font-family: Arial, sans-serif;
+        }
+        .ws-shell-tab {
+            flex: 1;
+            border: 0;
+            border-right: 1px solid #c7eef2;
+            background: transparent;
+            color: #147886;
+            font-weight: 700;
+            cursor: pointer;
+        }
+        .ws-shell-tab.active {
+            background: #21bfce;
+            color: #fff;
+        }
+        .ws-shell-panel {
+            display: none;
+            height: calc(100vh - 42px);
+        }
+        .ws-shell-panel.active {
+            display: block;
+        }
+        #wizard {
+            height: calc(100vh - 42px);
+            max-height: calc(100vh - 42px);
+            overflow-y: auto;
+        }
+        #tkReviewsFrame {
+            width: 100%;
+            height: 100%;
+            border: 0;
+        }
+	</style>
+</head>
+<body>
+<div class="ws-shell-tabs">
+	<button id="wsTabMain" class="ws-shell-tab active" type="button">Web Scraper</button>
+	<button id="wsTabTkReviews" class="ws-shell-tab" type="button">TK Reviews</button>
+</div>
+<div id="wsPanelMain" class="ws-shell-panel active">
+	<div id="wizard"></div>
+</div>
+<div id="wsPanelTkReviews" class="ws-shell-panel">
+	<iframe id="tkReviewsFrame" src="tiktok_reviews.html" title="TikTok Reviews"></iframe>
+</div>
+<script src="sidepanel_shell.js"></script>
+<script src="sidepanel.js"></script>
+</body>
+</html>
