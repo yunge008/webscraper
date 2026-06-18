@@ -188,7 +188,9 @@
           const s = chrome.runtime.lastError;
           if (null != s) {
             let e = s.toString();
-            return "[object Object]" === e && (e = JSON.stringify(s)), r && i.Log.error("Failed to send message to chrome tab", {
+            "[object Object]" === e && (e = JSON.stringify(s));
+            const isMissingReceiver = e.includes("Could not establish connection. Receiving end does not exist.");
+            return r && !isMissingReceiver && i.Log.error("Failed to send message to chrome tab", {
               error: e,
               request: JSON.stringify(t)
             }), o(`FAILED_TO_CONNECT_TO_CHROME_TAB ${e}`);

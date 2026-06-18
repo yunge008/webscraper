@@ -105,7 +105,13 @@
           method: t,
           params: r
         };
-        return p.ChromeTab.sendMessage(e, n);
+        try {
+          return yield p.ChromeTab.sendMessage(e, n, !1);
+        } catch (t) {
+          if (!k.Err.includesAnyOf(t, ["Could not establish connection. Receiving end does not exist."])) throw t;
+          yield P.ContentScriptLoader.injectContentScript(e);
+          return p.ChromeTab.sendMessage(e, n, !1);
+        }
       }));
     }
     init() {

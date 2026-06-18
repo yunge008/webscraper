@@ -51150,20 +51150,8 @@
                 setGeneratedSelectors(e, t) {
                     if (e === h.WizardPageType.multipleRecordsFromASinglePage) {
                         const e = t.findIndex((e => "SelectorElement" === e.type)), r = t[e];
-                        this.wrapperElementSelector = r.selector, t.splice(e, 1), this.multipleGeneratedSelectors = t, 
-                        this.ensureRatingSelector();
+                        this.wrapperElementSelector = r.selector, t.splice(e, 1), this.multipleGeneratedSelectors = t;
                     } else this.singleGeneratedSelectors = t;
-                }
-                ensureRatingSelector() {
-                    return;
-                    if (!/https?:\/\/seller\.tiktokshopglobalselling\.com\/product\/rating(?:[/?#]|$)/i.test(this.startUrl || "")) return;
-                    this.multipleGeneratedSelectors.some((e => "rating" === e.id)) || this.multipleGeneratedSelectors.unshift((0, l.selectorFactory)({
-                        parentSelectors: [ this.wrapperSelectorId ],
-                        type: "SelectorText",
-                        selector: "[class*=\"ratingStar\"], div:has(> svg[class*=\"activeStar\"]), span:has(> svg[class*=\"activeStar\"])",
-                        multiple: !1,
-                        id: "rating"
-                    }, !0));
                 }
                 renameGeneratedSelectors(e) {
                     let t, r, n;
@@ -56158,27 +56146,6 @@
                 willReturnElements() {
                     return !1;
                 }
-                isTikTokRatingPage(e) {
-                    return !1;
-                }
-                inferStarRating(e) {
-                    var _fb = function() {
-                        return e.getWrappedHTML().then(function(html) {
-                            var t = html || "";
-                            var m = t.match(/(?:aria-label|title|alt)=["'][^"']*?([1-5](?:\.\d+)?)\s*(?:\/\s*5|out of 5|star|stars|rating)/i);
-                            if (m) return m[1];
-                            var o = (t.match(/activeStar[\w-]*/gi) || []).length;
-                            var s = (t.match(/defaultStar[\w-]*/gi) || []).length;
-                            if (o + s === 5 && o >= 1) return String(o);
-                            if (o >= 1 && o <= 5) return String(o);
-                            return "";
-                        }, function() { return ""; });
-                    };
-                    return e.getElements('[class*="activeStar"]').then(function(a) {
-                        if (a && a.length >= 1 && a.length <= 5) return String(a.length);
-                        return _fb();
-                    }, function() { return _fb(); });
-                }
                 _getData(e) {
                     return o(this, arguments, (function*() {
                         const t = yield n(e.getElements(this.selector));
@@ -56601,27 +56568,6 @@
                 willReturnElements() {
                     return !1;
                 }
-                isTikTokRatingPage(e) {
-                    return !1;
-                }
-                inferStarRating(e) {
-                    var _fb = function() {
-                        return e.getWrappedHTML().then(function(html) {
-                            var t = html || "";
-                            var m = t.match(/(?:aria-label|title|alt)=["'][^"']*?([1-5](?:\.\d+)?)\s*(?:\/\s*5|out of 5|star|stars|rating)/i);
-                            if (m) return m[1];
-                            var o = (t.match(/activeStar[\w-]*/gi) || []).length;
-                            var s = (t.match(/defaultStar[\w-]*/gi) || []).length;
-                            if (o + s === 5 && o >= 1) return String(o);
-                            if (o >= 1 && o <= 5) return String(o);
-                            return "";
-                        }, function() { return ""; });
-                    };
-                    return e.getElements('[class*="activeStar"]').then(function(a) {
-                        if (a && a.length >= 1 && a.length <= 5) return String(a.length);
-                        return _fb();
-                    }, function() { return _fb(); });
-                }
                 _getData(e) {
                     return o(this, arguments, (function*() {
                         const t = yield n(this.getDataElements(e)), r = [];
@@ -56712,27 +56658,6 @@
                 }
                 willReturnElements() {
                     return !1;
-                }
-                isTikTokRatingPage(e) {
-                    return !1;
-                }
-                inferStarRating(e) {
-                    var _fb = function() {
-                        return e.getWrappedHTML().then(function(html) {
-                            var t = html || "";
-                            var m = t.match(/(?:aria-label|title|alt)=["'][^"']*?([1-5](?:\.\d+)?)\s*(?:\/\s*5|out of 5|star|stars|rating)/i);
-                            if (m) return m[1];
-                            var o = (t.match(/activeStar[\w-]*/gi) || []).length;
-                            var s = (t.match(/defaultStar[\w-]*/gi) || []).length;
-                            if (o + s === 5 && o >= 1) return String(o);
-                            if (o >= 1 && o <= 5) return String(o);
-                            return "";
-                        }, function() { return ""; });
-                    };
-                    return e.getElements('[class*="activeStar"]').then(function(a) {
-                        if (a && a.length >= 1 && a.length <= 5) return String(a.length);
-                        return _fb();
-                    }, function() { return _fb(); });
                 }
                 _getData(e) {
                     return o(this, arguments, (function*() {
@@ -56869,27 +56794,6 @@
                 }
                 willReturnElements() {
                     return !1;
-                }
-                isTikTokRatingPage(e) {
-                    return !1;
-                }
-                inferStarRating(e) {
-                    var _fb = function() {
-                        return e.getWrappedHTML().then(function(html) {
-                            var t = html || "";
-                            var m = t.match(/(?:aria-label|title|alt)=["'][^"']*?([1-5](?:\.\d+)?)\s*(?:\/\s*5|out of 5|star|stars|rating)/i);
-                            if (m) return m[1];
-                            var o = (t.match(/activeStar[\w-]*/gi) || []).length;
-                            var s = (t.match(/defaultStar[\w-]*/gi) || []).length;
-                            if (o + s === 5 && o >= 1) return String(o);
-                            if (o >= 1 && o <= 5) return String(o);
-                            return "";
-                        }, function() { return ""; });
-                    };
-                    return e.getElements('[class*="activeStar"]').then(function(a) {
-                        if (a && a.length >= 1 && a.length <= 5) return String(a.length);
-                        return _fb();
-                    }, function() { return _fb(); });
                 }
                 _getData(e) {
                     return o(this, arguments, (function*() {
@@ -57060,27 +56964,6 @@
                 }
                 willReturnElements() {
                     return !1;
-                }
-                isTikTokRatingPage(e) {
-                    return !1;
-                }
-                inferStarRating(e) {
-                    var _fb = function() {
-                        return e.getWrappedHTML().then(function(html) {
-                            var t = html || "";
-                            var m = t.match(/(?:aria-label|title|alt)=["'][^"']*?([1-5](?:\.\d+)?)\s*(?:\/\s*5|out of 5|star|stars|rating)/i);
-                            if (m) return m[1];
-                            var o = (t.match(/activeStar[\w-]*/gi) || []).length;
-                            var s = (t.match(/defaultStar[\w-]*/gi) || []).length;
-                            if (o + s === 5 && o >= 1) return String(o);
-                            if (o >= 1 && o <= 5) return String(o);
-                            return "";
-                        }, function() { return ""; });
-                    };
-                    return e.getElements('[class*="activeStar"]').then(function(a) {
-                        if (a && a.length >= 1 && a.length <= 5) return String(a.length);
-                        return _fb();
-                    }, function() { return _fb(); });
                 }
                 _getData(e) {
                     return i(this, arguments, (function*() {
@@ -57626,27 +57509,6 @@
                 }
                 willReturnElements() {
                     return !1;
-                }
-                isTikTokRatingPage(e) {
-                    return !1;
-                }
-                inferStarRating(e) {
-                    var _fb = function() {
-                        return e.getWrappedHTML().then(function(html) {
-                            var t = html || "";
-                            var m = t.match(/(?:aria-label|title|alt)=["'][^"']*?([1-5](?:\.\d+)?)\s*(?:\/\s*5|out of 5|star|stars|rating)/i);
-                            if (m) return m[1];
-                            var o = (t.match(/activeStar[\w-]*/gi) || []).length;
-                            var s = (t.match(/defaultStar[\w-]*/gi) || []).length;
-                            if (o + s === 5 && o >= 1) return String(o);
-                            if (o >= 1 && o <= 5) return String(o);
-                            return "";
-                        }, function() { return ""; });
-                    };
-                    return e.getElements('[class*="activeStar"]').then(function(a) {
-                        if (a && a.length >= 1 && a.length <= 5) return String(a.length);
-                        return _fb();
-                    }, function() { return _fb(); });
                 }
                 _getData(e) {
                     return o(this, arguments, (function*() {
@@ -58276,36 +58138,13 @@
                 willReturnElements() {
                     return !1;
                 }
-                isTikTokRatingPage(e) {
-                    return !1;
-                }
-                inferStarRating(e) {
-                    var _fb = function() {
-                        return e.getWrappedHTML().then(function(html) {
-                            var t = html || "";
-                            var m = t.match(/(?:aria-label|title|alt)=["'][^"']*?([1-5](?:\.\d+)?)\s*(?:\/\s*5|out of 5|star|stars|rating)/i);
-                            if (m) return m[1];
-                            var o = (t.match(/activeStar[\w-]*/gi) || []).length;
-                            var s = (t.match(/defaultStar[\w-]*/gi) || []).length;
-                            if (o + s === 5 && o >= 1) return String(o);
-                            if (o >= 1 && o <= 5) return String(o);
-                            return "";
-                        }, function() { return ""; });
-                    };
-                    return e.getElements('[class*="activeStar"]').then(function(a) {
-                        if (a && a.length >= 1 && a.length <= 5) return String(a.length);
-                        return _fb();
-                    }, function() { return _fb(); });
-                }
                 _getData(e) {
                     return o(this, arguments, (function*() {
-                        const t = yield n(e.getElements(this.selector)), o = "function" == typeof e.getPageUrl ? yield n(e.getPageUrl()) : "", s = this.isTikTokRatingPage(o);
+                        const t = yield n(e.getElements(this.selector));
                         !1 === this.multiple && 0 === t.length && (yield yield n(this.getEmptyRecord()));
                         const r = [];
                         for (const e of t) {
                             let t = yield n(e.getText());
-                            void 0 === t || null === t ? t = "" : t = `${t}`;
-                            s && (t = yield n(this.inferStarRating(e)));
                             if (void 0 !== this.regex && this.regex && this.regex.length) {
                                 const e = t.match(new RegExp(this.regex));
                                 t = null !== e ? e[0] : void 0;

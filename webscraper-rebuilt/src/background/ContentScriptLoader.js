@@ -47,9 +47,9 @@
         const t = yield chrome.scripting.getRegisteredContentScripts({
           ids: ["web_scraper_content_script"]
         });
-        if (t && t.length > 0) return;
         const r = yield i.ChromeTab.get(e);
         yield o.injectContentScriptInTab(r);
+        if (t && t.length > 0) return;
         const n = yield i.ChromeTab.query({});
         for (const t of n) t.id !== e && o.injectContentScriptInTab(t);
         yield chrome.scripting.registerContentScripts([{

@@ -1,62 +1,81 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="zh-CN">
 <head>
 	<meta charset="UTF-8">
 	<meta name="viewport" content="width=device-width, initial-scale=1.0">
-	<title>TK Reviews</title>
+	<title>TK评论抓取</title>
 	<link rel="stylesheet" href="tiktok_reviews.css">
 </head>
 <body>
 	<main class="tk-app">
 		<header class="tk-header">
-			<h1>TK Shop Reviews</h1>
-			<p>Fetch review data from the TikTok Shop product rating API.</p>
+			<h1>TK小店评论抓取</h1>
+			<p id="pageStatus" class="tk-muted">打开 TikTok 商品评价页后，将自动识别分页信息。</p>
 		</header>
 
-		<section class="tk-section">
-			<label>Automatic capture</label>
-			<div class="tk-actions">
-				<button id="startCapture" type="button">Install Capture & Refresh</button>
-				<button id="readCapture" type="button">Read Captured Data</button>
+		<section class="tk-control">
+			<div class="tk-page-row">
+				<div class="tk-page-field">
+					<label for="pageStart">起始页</label>
+					<input id="pageStart" type="number" min="1" value="1">
+				</div>
+				<div class="tk-page-field">
+					<label for="pageEnd">终止页</label>
+					<input id="pageEnd" type="number" min="1" value="30">
+				</div>
 			</div>
-			<p id="pageStatus" class="tk-muted">Open the TikTok rating page, then install capture and refresh.</p>
+			<div class="tk-stats-row">
+				<div class="tk-stats">
+					<div>
+						<span class="tk-stat-label">总条数</span>
+						<strong id="estimatedTotal">-</strong>
+					</div>
+					<div>
+						<span class="tk-stat-label">总页数</span>
+						<strong id="detectedTotalPages">-</strong>
+					</div>
+					<div>
+						<span class="tk-stat-label">每页条数</span>
+						<strong id="detectedPageSize">-</strong>
+					</div>
+				</div>
+				<button id="refreshStats" type="button" class="tk-refresh-stats">刷新</button>
+			</div>
+			<div class="tk-actions tk-main-actions">
+				<button id="fetchReviews" type="button">开始抓取评论</button>
+				<button id="downloadCsv" type="button" disabled>下载 Excel</button>
+				<button id="clearData" type="button">清空</button>
+			</div>
+			<div class="tk-actions tk-secondary-actions">
+				<button id="startCapture" type="button">重新安装监听</button>
+				<button id="readCapture" type="button">重新读取当前页</button>
+			</div>
+			<p id="pageHint" class="tk-muted tk-hint-row">将自动识别当前页面的分页信息。</p>
+			<progress id="progress" value="0" max="100" class="tk-progress-full"></progress>
+			<p id="status" class="tk-muted tk-status-row">默认抓取 1-30 页，可按需修改起始页和终止页。</p>
 		</section>
 
-		<section class="tk-section tk-grid one-field">
-			<div>
-				<label for="pageCount">Pages to fetch</label>
-				<input id="pageCount" type="number" min="1" value="1">
-			</div>
-		</section>
-
-		<section class="tk-section">
-			<div class="tk-actions">
-				<button id="fetchReviews" type="button">Fetch Reviews</button>
-				<button id="downloadCsv" type="button" disabled>Download CSV</button>
-				<button id="clearData" type="button">Clear</button>
-			</div>
-			<progress id="progress" value="0" max="100"></progress>
-			<p id="status" class="tk-muted">Paste a review list API URL, then load total.</p>
-		</section>
-
-		<section class="tk-section">
+		<section class="tk-section tk-results">
 			<div class="tk-summary">
-				<span id="rowCount">0 rows</span>
+				<span id="rowCount">0 条</span>
 				<span id="nextCursor"></span>
 			</div>
 			<div class="tk-table-wrap">
 				<table>
 					<thead>
 						<tr>
-							<th>star</th>
-							<th>review_text</th>
-							<th>reply_text</th>
-							<th>reply_count</th>
-							<th>main_review_id</th>
-							<th>order_id</th>
-							<th>product_id</th>
-							<th>user_name</th>
-							<th>create_time</th>
+							<th>星级</th>
+							<th>评论内容</th>
+							<th>回复内容</th>
+							<th>回复数</th>
+							<th>评论 ID</th>
+							<th>订单 ID</th>
+							<th>商品 ID</th>
+							<th>商品名称</th>
+							<th>SKU ID</th>
+							<th>SKU 规格</th>
+							<th>用户名</th>
+							<th>评论时间</th>
 						</tr>
 					</thead>
 					<tbody id="previewBody"></tbody>
