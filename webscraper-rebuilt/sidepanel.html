@@ -40,7 +40,7 @@
             max-height: calc(100vh - 42px);
             overflow-y: auto;
         }
-        #tkReviewsFrame {
+        #tkReviewsFrame, #tkDiagnosticsFrame {
             width: 100%;
             height: 100%;
             border: 0;
@@ -51,12 +51,16 @@
 <div class="ws-shell-tabs">
 	<button id="wsTabMain" class="ws-shell-tab active" type="button">通用抓取</button>
 	<button id="wsTabTkReviews" class="ws-shell-tab" type="button">TK评论抓取</button>
+	<button id="wsTabDiagnostics" class="ws-shell-tab" type="button">诊断</button>
 </div>
 <div id="wsPanelMain" class="ws-shell-panel active">
 	<div id="wizard"></div>
 </div>
 <div id="wsPanelTkReviews" class="ws-shell-panel">
 	<iframe id="tkReviewsFrame" src="tiktok_reviews.html" title="TK评论抓取"></iframe>
+</div>
+<div id="wsPanelDiagnostics" class="ws-shell-panel">
+	<iframe id="tkDiagnosticsFrame" src="tiktok_diagnostics.html" title="TK评论诊断"></iframe>
 </div>
 <script src="sidepanel_shell.js"></script>
 <script src="sidepanel.js"></script>

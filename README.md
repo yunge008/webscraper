@@ -1,5 +1,7 @@
 # Web Scraper Rebuild Handoff Notes
 
+Current TikTok review build: **1.107.28**, with Excel / text product-ID lists, combined XLSX export, all review modes without reloads and synchronous command polling for Chromium shells, persistent batch tasks, pause/resume and review-image links. See [TK分批任务使用说明](TK分批任务使用说明.md).
+
 This document is written for Claude, Codex, or another AI/developer that may continue this work later.
 
 The important context: this is not a new Chrome extension built from scratch. It is a rebuilt and modified copy of the original Web Scraper Chrome Extension v1.107.22, with cloud-related behavior removed and TikTok Shop review scraping improvements added.

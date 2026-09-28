@@ -1,0 +1,27 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>TK 评论诊断</title>
+  <link rel="stylesheet" href="tiktok_reviews.css">
+  <link rel="stylesheet" href="tiktok_diagnostics.css">
+</head>
+<body>
+  <main class="tk-app">
+    <h1>TK 评论诊断</h1>
+    <p>先打开目标店铺的商品评价页。探针只检查页面与监听状态，不刷新页面、不翻页。</p>
+    <div class="tk-actions">
+      <button id="probe" type="button">运行探针</button>
+      <button id="refresh" type="button">刷新报告</button>
+      <button id="copy" type="button">复制诊断</button>
+      <button id="download" type="button">下载报告</button>
+      <button id="clear" type="button">清空日志</button>
+    </div>
+    <p id="diagnosticStatus" role="status">正在读取诊断信息…</p>
+    <p>报告包含浏览器版本、错误步骤、注入探针、响应字段结构及 HTTP 状态；不包含评论正文、请求参数、请求体或认证头内容。</p>
+    <textarea id="report" readonly aria-label="诊断报告" spellcheck="false"></textarea>
+  </main>
+  <script src="tiktok_diagnostics.js"></script>
+</body>
+</html>

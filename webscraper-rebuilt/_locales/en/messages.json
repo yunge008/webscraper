@@ -1,9 +1,9 @@
 {
    "extDesc": {
-      "message": "Web data extraction tool with an easy point-and-click interface for modern web"
+      "message": "增加TK商品评论定量抓取"
    },
    "extName": {
-      "message": "$webScraper$ - Free Web Scraping",
+      "message": "web scraper rebuild",
       "placeholders": {
          "webScraper": {
             "content": "Web Scraper"

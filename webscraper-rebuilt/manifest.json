@@ -1,9 +1,9 @@
 {
   "manifest_version": 3,
-  "name": "__MSG_extName__",
-  "short_name": "Web Scraper",
-  "description": "__MSG_extDesc__",
-  "version": "1.107.22",
+  "name": "web scraper rebuild",
+  "short_name": "web scraper rebuild",
+  "description": "增加TK商品评论定量抓取",
+  "version": "1.107.28",
   "minimum_chrome_version": "120",
   "default_locale": "en",
 
@@ -13,7 +13,7 @@
       "24": "images/icon24.png",
       "32": "images/icon32.png"
     },
-    "default_title": "Web Scraper"
+    "default_title": "web scraper rebuild"
   },
 
   "background": {
