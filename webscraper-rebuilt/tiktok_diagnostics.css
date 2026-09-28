@@ -1,6 +1,2 @@
-body { overflow: auto; }
-.tk-app { min-height: 100vh; height: auto; }
-h1 { color: #0d7480; font-size: 18px; margin: 4px 0; }
-p { margin: 4px 0; line-height: 1.5; font-size: 13px; }
-.tk-actions { flex-wrap: wrap; }
-#report { flex: 1; width: 100%; min-height: 45vh; resize: vertical; padding: 10px; border: 1px solid #c7eef2; font: 12px/1.5 Consolas, monospace; background: white; }
+#report { flex: 1; width: 100%; min-height: 55vh; resize: vertical; padding: 10px; border: 1px solid #c7eef2; border-radius: 6px; font: 12px/1.5 Consolas, monospace; background: #fff; }
+p { margin: 0; line-height: 1.5; }

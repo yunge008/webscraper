@@ -9,134 +9,87 @@
 <body>
 	<main class="tk-app">
 		<header class="tk-header">
-			<h1>TK小店评论抓取</h1>
-			<p id="pageStatus" class="tk-muted">打开 TikTok 商品评价页后，将自动识别分页信息。</p>
+			<h1>TK小店评论抓取 <span id="version" class="tk-muted"></span></h1>
+			<p id="pageStatus" class="tk-muted">正在识别商品评价页…</p>
 		</header>
-		<p id="taskNotice" class="tk-notice" role="status" aria-live="polite" hidden></p>
+		<p id="errorBanner" class="tk-error" role="alert" hidden></p>
 
 		<section class="tk-control">
-			<div class="tk-product-field">
-				<label for="productSearchId">固定商品 / SKU ID</label>
-				<input id="productSearchId" type="text" inputmode="numeric" autocomplete="off" placeholder="例如 1731892023085009910">
-				<p class="tk-muted">填写后先搜索并核对商品 ID，全程不刷新页面。留空时使用页面已有数字 ID；采集其他筛选结果请在下方选择对应范围。</p>
+			<fieldset class="tk-mode">
+				<legend>采集范围</legend>
+				<label class="tk-radio"><input type="radio" name="mode" value="current" checked> 当前页面筛选结果（保留日期、星级等条件）</label>
+				<label class="tk-radio"><input type="radio" name="mode" value="ids"> 指定商品 / SKU ID（一个或多个）</label>
+			</fieldset>
+
+			<div id="idsBox" hidden>
+				<label for="productIds">商品 / SKU ID（一行一个；只填一个即为固定单个商品）</label>
+				<textarea id="productIds" rows="4" spellcheck="false" placeholder="1731892023085009910"></textarea>
+				<div class="tk-inline">
+					<label class="tk-file">上传 Excel（含 id 列）<input id="idFile" type="file" accept=".xlsx,.xls,.csv"></label>
+					<span id="idCount" class="tk-muted">0 个 ID</span>
+				</div>
+				<p class="tk-muted">ID 会自动保存，刷新页面或重开侧栏不会丢失。页面上的日期等其他筛选条件保持不变，只替换商品条件；返回的评论必须全部属于该 ID，否则停止，不会改抓全店评论。</p>
 			</div>
-			<div class="tk-page-row">
-				<div class="tk-page-field">
-					<label for="pageStart">起始页</label>
-					<input id="pageStart" type="number" min="1" value="1">
-				</div>
-				<div class="tk-page-field">
-					<label for="pageEnd">终止页</label>
-					<input id="pageEnd" type="number" min="1" value="30">
-				</div>
+
+			<div class="tk-grid">
+				<label>起始页<input id="startPage" type="number" min="1" value="1"></label>
+				<label>终止页<input id="endPage" type="number" min="1" placeholder="全部"></label>
+				<label>每页条数<input id="pageSize" type="number" min="1" max="100" value="50"></label>
+				<label>每批页数<input id="batchSize" type="number" min="1" max="1000" value="50"></label>
+				<label>页间隔(ms)<input id="delayMs" type="number" min="0" max="10000" value="600"></label>
+				<label>翻页方式
+					<select id="driver">
+						<option value="auto">自动（接口优先）</option>
+						<option value="api">仅接口直连</option>
+						<option value="ui">仅页面点击翻页</option>
+					</select>
+				</label>
 			</div>
-			<div class="tk-stats-row">
-				<div class="tk-stats">
-					<div>
-						<span class="tk-stat-label">总条数</span>
-						<strong id="estimatedTotal">-</strong>
-					</div>
-					<div>
-						<span class="tk-stat-label">总页数</span>
-						<strong id="detectedTotalPages">-</strong>
-					</div>
-					<div>
-						<span class="tk-stat-label">每页条数</span>
-						<strong id="detectedPageSize">-</strong>
-					</div>
-				</div>
-				<button id="refreshStats" type="button" class="tk-refresh-stats">刷新</button>
+			<p class="tk-muted">终止页留空 = 采集全部页。“每页条数”仅在接口直连时生效；页面点击模式沿用页面当前每页条数。</p>
+
+			<div class="tk-actions">
+				<button id="createTask" type="button" class="tk-primary">创建并开始任务</button>
+				<button id="pauseTask" type="button" disabled>暂停</button>
+				<button id="resumeTask" type="button" disabled>继续</button>
 			</div>
-			<div class="tk-actions tk-main-actions">
-				<button id="fetchReviews" type="button">开始抓取评论</button>
-				<button id="downloadCsv" type="button" disabled>任务 Excel</button>
-				<button id="clearData" type="button">清空</button>
+
+			<div class="tk-stats">
+				<div><span class="tk-stat-label">接口总条数</span><strong id="statTotal">-</strong></div>
+				<div><span class="tk-stat-label">已采集</span><strong id="statRows">0</strong></div>
+				<div><span class="tk-stat-label">评价图</span><strong id="statImages">0</strong></div>
+				<div><span class="tk-stat-label">翻页方式</span><strong id="statDriver">-</strong></div>
 			</div>
-			<div class="tk-actions tk-secondary-actions">
-				<button id="startCapture" type="button">重新安装监听</button>
-				<button id="readCapture" type="button">重新读取当前页</button>
-			</div>
-			<details class="tk-task-controls" open>
-				<summary>分批任务与评价图</summary>
-				<label for="taskMode">采集范围</label>
-				<select id="taskMode">
-					<option value="fixed">单个固定商品 / SKU</option>
-					<option value="current">当前页面筛选结果（保留日期等条件）</option>
-					<option value="list">商品 ID 列表（逐个搜索并合并）</option>
-				</select>
-				<div id="taskProductList" hidden>
-					<label for="taskIds">商品 ID 列表（一行一个）</label>
-					<textarea id="taskIds" rows="4" placeholder="1731892023085009910"></textarea>
-					<label for="taskIdFile">或上传 Excel（列名 id / 商品ID，ID 请保存为文本）</label>
-					<input id="taskIdFile" type="file" accept=".xlsx,.xls">
-					<p id="taskImportStatus" class="tk-muted" role="status">上传会替换文本框中的列表，自动去重。</p>
-				</div>
-				<div class="tk-task-options">
-					<label>每批页数<input id="taskBatchSize" type="number" min="1" max="500" value="50"></label>
-					<label class="tk-check"><input id="taskAllPages" type="checkbox" checked>采集全部页（从起始页开始）</label>
-					<label>评价图字段路径（可选）<input id="taskImagePath" type="text" placeholder="例如 review_images"></label>
-				</div>
-				<p class="tk-muted">当前筛选和列表模式不刷新页面，不改日期、评分或每页条数；列表模式只切换商品 ID。建议每页 50 条。关闭侧栏后可续跑；列表异常时暂停并保留已采集数据。</p>
-				<div class="tk-actions">
-					<button id="taskCreate" type="button">创建并开始任务</button>
-					<button id="taskPause" type="button" disabled>暂停任务</button>
-					<button id="taskResume" type="button" disabled>继续任务</button>
-					<button id="taskRetry" type="button" disabled>重试失败批次</button>
-				</div>
+			<progress id="progress" value="0" max="100" class="tk-progress-full"></progress>
+			<p id="status" class="tk-status-row" role="status" aria-live="polite">准备就绪。</p>
+		</section>
+
+		<section class="tk-section">
+			<div class="tk-inline">
 				<label for="taskSelect">已保存任务</label>
 				<select id="taskSelect"><option value="">暂无任务</option></select>
-				<p id="taskStatus" class="tk-muted" role="status">任务数据保存在此浏览器的扩展中。</p>
-				<div class="tk-actions">
-					<button id="taskExportXlsx" type="button" disabled>任务 Excel</button>
-					<button id="taskExportCsv" type="button" disabled>评论 CSV</button>
-					<button id="taskExportImages" type="button" disabled>评价图 CSV</button>
-					<button id="taskExportManifest" type="button" disabled>任务清单</button>
-				</div>
-				<div class="tk-actions">
-					<label>导出批次<select id="taskBatchSelect"><option value="0">全部</option></select></label>
-					<button id="taskRescan" type="button" disabled>从头去重补扫</button>
-				</div>
-			</details>
-			<p id="pageHint" class="tk-muted tk-hint-row">将自动识别当前页面的分页信息。</p>
-			<progress id="progress" value="0" max="100" class="tk-progress-full"></progress>
-			<p id="status" class="tk-muted tk-status-row">默认抓取 1-30 页，可按需修改起始页和终止页。</p>
+			</div>
+			<p id="taskInfo" class="tk-muted"></p>
+			<div class="tk-actions">
+				<button id="exportXlsx" type="button" disabled>导出 Excel</button>
+				<button id="downloadImages" type="button" disabled>下载评价图</button>
+				<button id="deleteTask" type="button" disabled>删除任务</button>
+			</div>
 		</section>
 
 		<section class="tk-section tk-results">
-			<div class="tk-summary">
-				<span id="rowCount">0 条</span>
-				<span id="nextCursor"></span>
-			</div>
+			<div class="tk-summary"><span id="rowCount">预览（最近 50 条）</span></div>
 			<div class="tk-table-wrap">
 				<table>
-					<thead>
-						<tr>
-							<th>星级</th>
-							<th>评论内容</th>
-							<th>回复内容</th>
-							<th>回复数</th>
-							<th>评论 ID</th>
-							<th>订单 ID</th>
-							<th>商品 ID</th>
-							<th>商品名称</th>
-							<th>SKU ID</th>
-							<th>SKU 规格</th>
-							<th>用户名</th>
-							<th>评论时间</th>
-							<th>评价图数量</th>
-							<th>评价图链接</th>
-						</tr>
-					</thead>
+					<thead><tr id="previewHead"></tr></thead>
 					<tbody id="previewBody"></tbody>
 				</table>
 			</div>
 		</section>
 	</main>
 	<script src="sheetjs-0.20.3.min.js"></script>
+	<script src="tiktok_core.js"></script>
+	<script src="tiktok_store.js"></script>
 	<script src="tiktok_product_import.js"></script>
-	<script src="tiktok_review_tasks.js"></script>
-	<script src="tiktok_review_export.js"></script>
 	<script src="tiktok_reviews.js"></script>
-	<script src="tiktok_task_ui.js"></script>
 </body>
 </html>

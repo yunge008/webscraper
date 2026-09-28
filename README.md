@@ -1,6 +1,6 @@
 # Web Scraper Rebuild Handoff Notes
 
-Current TikTok review build: **1.107.28**, with Excel / text product-ID lists, combined XLSX export, all review modes without reloads and synchronous command polling for Chromium shells, persistent batch tasks, pause/resume and review-image links. See [TK分批任务使用说明](TK分批任务使用说明.md).
+Current TikTok review build: **1.108.0** (Chrome only). The TK review module was rewritten: API replay of the captured review request with page-click fallback, current-filter / product-ID / Excel-list scopes, review images, batched resumable tasks and merged XLSX export. See [TK评论采集使用说明](TK评论采集使用说明.md). The "TikTok Shop Custom Work" section below describes the older DOM-based approach and is kept for history.
 
 This document is written for Claude, Codex, or another AI/developer that may continue this work later.
 

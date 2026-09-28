@@ -1,1489 +1,863 @@
+// TK 评论抓取：侧栏控制器（仅面向 Chrome）。
+// 采集方式：
+//   1. 页面监听（tiktok_capture_hook.js，MAIN world）记录评论接口的请求与响应；
+//   2. 接口直连：以捕获的请求为模板，只改页码 / 每页条数 / 商品 ID，通过页面自身的 XHR/fetch 重放；
+//   3. 页面点击：接口直连不可用时，在页面上搜索商品、点击下一页并读取捕获的响应（旧版可用的方式）。
+// 全程不刷新页面，因此页面上的日期等筛选条件保持不变。
 (function() {
-  const els = {
-    startCapture: document.getElementById("startCapture"),
-    readCapture: document.getElementById("readCapture"),
-    pageStart: document.getElementById("pageStart"),
-    pageEnd: document.getElementById("pageEnd"),
-    productSearchId: document.getElementById("productSearchId"),
-    refreshStats: document.getElementById("refreshStats"),
-    fetchReviews: document.getElementById("fetchReviews"),
-    downloadCsv: document.getElementById("downloadCsv"),
-    clearData: document.getElementById("clearData"),
-    progress: document.getElementById("progress"),
-    status: document.getElementById("status"),
-    pageStatus: document.getElementById("pageStatus"),
-    pageHint: document.getElementById("pageHint"),
-    estimatedTotal: document.getElementById("estimatedTotal"),
-    detectedTotalPages: document.getElementById("detectedTotalPages"),
-    detectedPageSize: document.getElementById("detectedPageSize"),
-    rowCount: document.getElementById("rowCount"),
-    nextCursor: document.getElementById("nextCursor"),
-    previewBody: document.getElementById("previewBody")
-  };
+  "use strict";
+  const C = window.TKCore;
+  const store = new window.TKStore();
+  const $ = id => document.getElementById(id);
+  const els = {};
+  for (const id of ["version", "pageStatus", "errorBanner", "idsBox", "productIds", "idFile", "idCount", "startPage", "endPage", "pageSize", "batchSize", "delayMs", "driver", "createTask", "pauseTask", "resumeTask", "statTotal", "statRows", "statImages", "statDriver", "progress", "status", "taskSelect", "taskInfo", "exportXlsx", "downloadImages", "deleteTask", "rowCount", "previewHead", "previewBody"]) els[id] = $(id);
+  const VERSION = chrome.runtime.getManifest().version;
+  const FORM_KEY = "tkReviewForm";
+  const PREVIEW_COLUMNS = C.OUTPUT_COLUMNS.filter(([key]) => key !== "review_image_urls");
 
-  const captureScriptId = "tk-review-capture-hook";
-  // TikTok Shop uses different seller domains by region. The path is stable.
-  const ratingPageMatches = ["https://*.tiktokshop.com/product/rating*", "https://*.tiktokshopglobalselling.com/product/rating*"];
-  const diagnosticEvents = [];
-  let probeResults = null;
-  let actionBusy = false;
-  let lockedTabId = 0;
-  let lockedProductId = "";
-  let productInputDescriptor = null;
-  let filterProbe = null;
-  let taskPageCache = null;
-  let taskDiagnostic = null;
-  let activeTabId = 0;
-  let rows = [];
-  let previewRows = [];
-  let capturedRequest = null;
-  let capturedPayload = null;
-  let isFetching = false;
-  let stopRequested = false;
-  let pageInfo = {
-    totalPages: 0,
-    pageSize: 0,
-    estimatedTotal: 0
-  };
-  const outputColumns = [
-    "star_level",
-    "review_text",
-    "reply_text",
-    "reply_count",
-    "main_review_id",
-    "order_id",
-    "product_id",
-    "product_name",
-    "sku_id",
-    "sku_specification",
-    "user_name",
-    "create_time", "review_image_count", "review_image_urls"
-  ];
-  const outputColumnLabels = {
-    star_level: "星级",
-    review_text: "评论内容",
-    reply_text: "回复内容",
-    reply_count: "回复数",
-    main_review_id: "评论 ID",
-    order_id: "订单 ID",
-    product_id: "商品 ID",
-    product_name: "商品名称",
-    sku_id: "SKU ID",
-    sku_specification: "SKU 规格",
-    user_name: "用户名",
-    create_time: "评论时间", review_image_count: "评价图数量", review_image_urls: "评价图链接"
-  };
+  const events = [];
+  let busy = false;          // 有任务在运行或正在执行一个操作
+  let pauseRequested = false;
+  let running = null;        // 正在运行的任务
+  let selectedId = "";
+  let tabId = 0;
+  let preview = [];
+  const sentReplays = new Set();
 
-  function setStatus(text) {
-    els.status.textContent = text;
-    const notice = document.getElementById("taskNotice");
-    if (notice) { notice.textContent = text; notice.hidden = false; }
-    logDiagnostic("status", text);
+  // ---------------- 日志 / 状态 ----------------
+  function sanitize(text) { return String(text == null ? "" : text).replace(/(https?:\/\/[^\s?#"']+)[^\s"']*/g, "$1"); }
+  function logEvent(level, message, extra) {
+    events.push({ time: new Date().toISOString(), level, message: sanitize(message), ...(extra ? { extra: sanitize(extra) } : {}) });
+    while (events.length > 300) events.shift();
+  }
+  function setStatus(text) { els.status.textContent = text; logEvent("info", text); }
+  function showError(error) {
+    const message = error && error.message ? error.message : String(error);
+    els.errorBanner.textContent = `错误：${message}\n（可在“诊断”页复制完整报告）`;
+    els.errorBanner.hidden = false;
+    els.status.textContent = `错误：${message}`;
+    logEvent("error", message, error && error.stack);
+    console.error("[TK评论抓取]", error);
+  }
+  function clearError() { els.errorBanner.hidden = true; els.errorBanner.textContent = ""; }
+  function kindError(kind, message) { const e = new Error(message); e.kind = kind; return e; }
+  const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+  async function pausableSleep(ms) {
+    const end = Date.now() + ms;
+    while (Date.now() < end) { if (pauseRequested) return; await sleep(Math.min(200, end - Date.now())); }
+  }
+  function withTimeout(promise, ms, label) {
+    let timer;
+    return Promise.race([promise, new Promise((_, reject) => { timer = setTimeout(() => reject(new Error(`${label}超时（${Math.round(ms / 1000)} 秒）`)), ms); })]).finally(() => clearTimeout(timer));
   }
 
-  function safeUrl(value) {
-    try { const url = new URL(value); return url.origin + url.pathname; }
-    catch (_) { return "<无URL>"; }
+  // ---------------- 标签页与页面脚本 ----------------
+  function isRatingUrl(url) {
+    try {
+      const u = new URL(url);
+      return u.protocol === "https:" && /(^|\.)(tiktokshop|tiktokshopglobalselling|tiktokglobalshop)\.com$/i.test(u.hostname) && /\/product\/(rating|review)/i.test(u.pathname);
+    } catch (_) { return false; }
   }
-
-  function logDiagnostic(type, message) {
-    const safeMessage = String(message).replace(/https?:\/\/[^\s｜；]+/g, safeUrl);
-    diagnosticEvents.push({ time: new Date().toISOString(), type, message: safeMessage });
-    if (diagnosticEvents.length > 150) diagnosticEvents.shift();
+  async function findRatingTab() {
+    const [active] = await chrome.tabs.query({ active: true, currentWindow: true });
+    if (active && isRatingUrl(active.url || "")) return active;
+    const inWindow = (await chrome.tabs.query({ currentWindow: true })).filter(t => isRatingUrl(t.url || ""));
+    if (inWindow.length === 1) return inWindow[0];
+    if (inWindow.length > 1) {
+      const sorted = inWindow.sort((a, b) => (b.lastAccessed || 0) - (a.lastAccessed || 0));
+      return sorted[0];
+    }
+    const all = (await chrome.tabs.query({})).filter(t => isRatingUrl(t.url || "")).sort((a, b) => (b.lastAccessed || 0) - (a.lastAccessed || 0));
+    if (all.length) return all[0];
+    throw kindError("fatal", "未找到 TikTok Shop 商品评价页（/product/rating）。请先在当前窗口打开并切换到评价页。");
   }
-
-  // Some Chromium shells implement callbacks but do not return Promises.
-  function chromeCall(namespace, method, argument, timeout = 15000) {
-    return new Promise((resolve, reject) => {
-      let settled = false;
-      const timer = setTimeout(() => finish(new Error(`${namespace}.${method} 超时（${timeout / 1000} 秒）`)), timeout);
-      function finish(error, value) {
-        if (settled) return;
-        settled = true;
-        clearTimeout(timer);
-        if (error) reject(error); else resolve(value);
-      }
-      try {
-        const api = chrome[namespace];
-        if (!api || typeof api[method] !== "function") throw new Error(`浏览器不支持 ${namespace}.${method}`);
-        const promise = api[method](argument, value => {
-          const error = chrome.runtime && chrome.runtime.lastError;
-          finish(error ? new Error(error.message || String(error)) : null, value);
-        });
-        if (promise && typeof promise.then === "function") promise.then(value => {
-          const expectsValue = (namespace === "tabs" && /^(query|get)$/.test(method)) || (namespace === "scripting" && /^(executeScript|getRegisteredContentScripts)$/.test(method));
-          if (value !== undefined || !expectsValue) finish(null, value);
-        }, error => finish(error));
-      } catch (error) { finish(error); }
-    });
-  }
-
-  async function executeScript(options) {
-    const results = await chromeCall("scripting", "executeScript", options);
-    if (!Array.isArray(results) || !results.length) throw new Error("脚本注入未返回结果，请运行诊断探针。");
-    for (const result of results) if (result.error) throw new Error(result.error.message || String(result.error));
-    return results;
-  }
-
-  function errorText(error) {
-    if (!error) return "未知错误";
-    return error.message || String(error);
-  }
-
-  function stageError(stage, error) {
-    const wrapped = new Error(`${stage}失败：${errorText(error)}`);
-    wrapped.cause = error;
-    return wrapped;
-  }
-
-  function setProgress(done, max) {
-    els.progress.max = Math.max(max || 100, 1);
-    els.progress.value = Math.max(done || 0, 0);
-  }
-
-  function sleep(ms) {
-    return new Promise(resolve => setTimeout(resolve, ms));
-  }
-
-  function queryTabs(queryInfo) {
-    return chromeCall("tabs", "query", queryInfo).then(tabs => Array.isArray(tabs) ? tabs : []);
-  }
-
-  function tabUrl(tab) {
-    return (tab && (tab.url || tab.pendingUrl)) || "";
-  }
-
-  function describeTabs(tabs) {
-    if (!tabs || !tabs.length) return "0 个标签页";
-    return tabs.map(tab => `id=${tab.id}, active=${!!tab.active}, url=${safeUrl(tabUrl(tab))}`).join(" | ");
-  }
-
-  async function getActiveTab() {
-    if (lockedTabId) {
-      const tab = await chromeCall("tabs", "get", lockedTabId);
-      if (!tab || !isTikTokRatingUrl(tabUrl(tab))) throw new Error("抓取目标已关闭或离开评价页，请停止后重新开始。");
+  async function useTab(lock) {
+    if (lock && tabId) {
+      let tab;
+      try { tab = await chrome.tabs.get(tabId); } catch (_) { throw kindError("fatal", "评价页标签已关闭，任务已暂停。"); }
+      if (!isRatingUrl(tab.url || "")) throw kindError("fatal", "评价页已跳转到其他页面，任务已暂停。");
       return tab;
     }
-    let currentTabs;
-    try {
-      currentTabs = await queryTabs({ active: true, currentWindow: true });
-    } catch (error) {
-      throw stageError("查询当前标签页（chrome.tabs.query callback）", error);
-    }
-    const activeTab = currentTabs[0] || null;
-    if (activeTab && isTikTokRatingUrl(tabUrl(activeTab))) return activeTab;
-
-    let allTabs;
-    try {
-      allTabs = await queryTabs({ currentWindow: true });
-    } catch (error) {
-      throw stageError("查询当前窗口标签页", error);
-    }
-    const ratingTabs = allTabs.filter(tab => isTikTokRatingUrl(tabUrl(tab)));
-    if (ratingTabs.length === 1) return ratingTabs[0];
-    if (ratingTabs.length > 1) throw new Error("当前窗口有多个评价页，请先切换到要抓取的店铺评价页。");
-
-    const diagnostic = `活动页：${describeTabs(currentTabs)}；当前窗口：${describeTabs(allTabs)}`;
-    throw new Error(`未找到 /product/rating 页面。${diagnostic}`);
+    const tab = await findRatingTab();
+    tabId = tab.id;
+    els.pageStatus.textContent = `评价页：标签 ${tab.id} · ${sanitize(tab.url)}`;
+    return tab;
   }
-  function isTikTokRatingUrl(url) {
-    try {
-      const parsed = new URL(url);
-      return parsed.protocol === "https:" && /^seller(?:-[a-z0-9-]+)?\.(?:tiktokshop\.com|tiktokshopglobalselling\.com)$/i.test(parsed.hostname) && /^\/product\/rating\/?$/i.test(parsed.pathname);
-    } catch (error) {
-      return false;
+  async function exec(func, args = [], world = "MAIN", timeout = 20000) {
+    const results = await withTimeout(chrome.scripting.executeScript({ target: { tabId }, world, func, args }), timeout, "页面脚本执行");
+    const first = results && results[0];
+    if (!first) throw new Error("页面脚本没有返回结果（页面可能正在加载）");
+    return first.result;
+  }
+  async function hook(name, ...args) {
+    const result = await exec((name, args) => {
+      if (!window.__TKR__ || typeof window.__TKR__[name] !== "function") return { __missing: true };
+      return window.__TKR__[name](...args);
+    }, [name, args], "MAIN", name === "replay" ? 60000 : 20000);
+    if (result && result.__missing) throw kindError("fatal", "页面监听未安装。");
+    return result;
+  }
+  async function ensureHook() {
+    const ok = await exec(() => !!(window.__TKR__ && window.__TKR__.version >= 3));
+    if (!ok) {
+      await withTimeout(chrome.scripting.executeScript({ target: { tabId }, world: "MAIN", files: ["tiktok_capture_hook.js"] }), 20000, "注入页面监听");
+      logEvent("info", "页面监听为补注入（页面在扩展加载前打开）。");
     }
+    return hook("status");
   }
 
-  async function refreshActiveTabStatus() {
-    let tab;
-    try {
-      tab = await getActiveTab();
-    } catch (error) {
-      activeTabId = 0;
-      els.pageStatus.textContent = `修复诊断版 ${chrome.runtime.getManifest().version}｜标签页识别失败：${errorText(error)}`;
-      throw stageError("步骤 1/6 标签页识别", error);
-    }
-    activeTabId = tab.id || 0;
-    if (actionBusy && !lockedTabId) lockedTabId = activeTabId;
-    const url = tabUrl(tab);
-    if (!activeTabId || !isTikTokRatingUrl(url)) {
-      const message = `标签页不符合要求：id=${activeTabId || "无"}, url=${url || "<无URL>"}`;
-      els.pageStatus.textContent = `修复诊断版 ${chrome.runtime.getManifest().version}｜${message}`;
-      throw new Error(message);
-    }
-    els.pageStatus.textContent = `修复诊断版 ${chrome.runtime.getManifest().version}｜已锁定标签页 ${activeTabId}：${url}`;
-    try { await detectPageInfo(); }
-    catch (error) { logDiagnostic("pagination", errorText(error)); }
-    return true;
+  // ---------------- 捕获记录 ----------------
+  function replayKey(url, body) { return `${url}\n${body || ""}`; }
+  function parseRecord(record) {
+    const json = C.parseJson(record.responseText);
+    return { json, payload: json ? C.findReviewPayload(json) : null };
   }
-
-  async function detectPageInfo() {
-    if (!activeTabId) return;
-    const [result] = await executeScript({
-      target: { tabId: activeTabId },
-      world: "ISOLATED",
-      func: () => {
-        const pageNumbers = Array.from(document.querySelectorAll(".core-pagination-item"))
-          .map(el => (el.textContent || "").trim())
-          .map(text => parseInt(text.replace(/[^\d]/g, ""), 10))
-          .filter(number => Number.isFinite(number) && number > 0);
-        const totalPages = pageNumbers.length ? Math.max(...pageNumbers) : 0;
-        const pageSizeText = Array.from(document.querySelectorAll(".core-select-view-value, [aria-label='Page size'], [class*='select-view-value']"))
-          .map(el => (el.textContent || "").trim())
-          .find(text => /\d+\s*\/\s*Page/i.test(text)) || "";
-        const pageSizeMatch = pageSizeText.match(/(\d+)\s*\/\s*Page/i);
-        const pageSize = pageSizeMatch ? parseInt(pageSizeMatch[1], 10) : 0;
-        const activePage = document.querySelector(".core-pagination-item-active, .core-pagination-item[aria-current='page']");
-        return {
-          totalPages,
-          pageSize,
-          currentPage: activePage ? parseInt(activePage.textContent, 10) || 0 : 0,
-          pageSizeText,
-          estimatedTotal: totalPages && pageSize ? totalPages * pageSize : 0
-        };
+  function templateOf(record) {
+    return { transport: record.transport, method: record.method, url: record.url, headers: record.headers || {}, body: record.body, activePage: record.activePage || 0 };
+  }
+  // 等待 afterSeq 之后出现满足条件的评论响应
+  async function waitForRecord(afterSeq, accept, timeout = 20000) {
+    const end = Date.now() + timeout;
+    let lastReason = "";
+    while (Date.now() < end) {
+      if (pauseRequested) throw kindError("paused", "已暂停");
+      const records = (await hook("recordsAfter", afterSeq, false)) || [];
+      for (let i = records.length - 1; i >= 0; i--) {
+        const record = records[i];
+        if (sentReplays.has(replayKey(record.url, record.body))) continue;
+        if (record.status === 401 || record.status === 403) throw kindError("fatal", `评论接口返回 HTTP ${record.status}，请确认店铺登录状态。`);
+        if (record.status && (record.status < 200 || record.status >= 300)) { lastReason = `HTTP ${record.status}`; continue; }
+        const { payload } = parseRecord(record);
+        if (!payload) { lastReason = "响应中没有评论列表"; continue; }
+        const verdict = accept(record, payload);
+        if (verdict === true) return { record, payload };
+        if (typeof verdict === "string") lastReason = verdict;
       }
+      await sleep(400);
+    }
+    return { timeout: true, reason: lastReason };
+  }
+
+  // ---------------- 学习到的商品参数路径 ----------------
+  function endpointOf(url) { try { return new URL(url).pathname; } catch (_) { return ""; } }
+  async function learnedProductPath(template) {
+    const key = `tkProductPath:${endpointOf(template.url)}`;
+    const saved = (await chrome.storage.local.get(key))[key];
+    return saved && C.hasPath(template, saved) ? saved : null;
+  }
+  async function saveProductPath(template, path) {
+    await chrome.storage.local.set({ [`tkProductPath:${endpointOf(template.url)}`]: path });
+  }
+  function chooseProductPath(record, id) {
+    const paths = C.findValuePaths(record, id);
+    if (!paths.length) return null;
+    paths.sort((a, b) => Number(/product|item|sku|search|keyword|query/i.test(b.key)) - Number(/product|item|sku|search|keyword|query/i.test(a.key)));
+    return paths[0].path;
+  }
+
+  // ---------------- 接口直连 ----------------
+  function setupTemplate(task, template) {
+    task.template = template;
+    const analysis = C.analyzeTemplate(template, { activePage: template.activePage });
+    task.pagination = analysis.pagination;
+    const cursorLeaf = task.pagination.cursorPath ? analysis.leaves.find(l => C.pathKey(l.path) === C.pathKey(task.pagination.cursorPath)) : null;
+    const pageLeaf = task.pagination.pagePath ? analysis.leaves.find(l => C.pathKey(l.path) === C.pathKey(task.pagination.pagePath)) : null;
+    const templateIsFirst = pageLeaf ? Number(String(pageLeaf.value).replace(/\D/g, "")) === task.pagination.pageBase : (template.activePage || 1) <= 1;
+    const cursorValue = cursorLeaf ? String(cursorLeaf.value).replace(/^__TKBIG__/, "") : "";
+    task.firstCursor = templateIsFirst ? cursorValue : (/^\d+$/.test(cursorValue) ? "0" : "");
+    task.sizeUsed = task.pagination.sizePath ? (task.config.pageSize || task.pagination.pageSize) : 0;
+  }
+  async function apiFetchPage(task, item, page) {
+    const spec = C.buildRequest(task.template, task.pagination, {
+      page, pageSize: task.pagination.sizePath ? (item.sizeOverride || task.sizeUsed) : 0,
+      cursor: task.pagination.cursorPath ? (page === 1 ? task.firstCursor : item.cursor || "") : undefined,
+      productId: item.targetId, productPath: item.targetId ? task.productPath : null, stripSign: !!task.stripSign
     });
-    pageInfo = result && result.result ? result.result : pageInfo;
-    renderPageInfo();
-  }
-
-  function renderPageInfo(totalFromApi) {
-    const totalPages = Number(pageInfo.totalPages || 0);
-    const pageSize = Number(pageInfo.pageSize || 0);
-    const estimated = Number(totalFromApi || pageInfo.estimatedTotal || 0);
-    els.detectedTotalPages.textContent = totalPages ? String(totalPages) : "-";
-    els.detectedPageSize.textContent = pageSize ? String(pageSize) : "-";
-    els.estimatedTotal.textContent = estimated ? String(estimated) : "-";
-    els.pageStart.max = totalPages ? String(totalPages) : "";
-    els.pageEnd.max = totalPages ? String(totalPages) : "";
-    els.pageHint.textContent = totalPages && pageSize
-      ? `已识别 ${totalPages} 页，每页 ${pageSize} 条。默认抓取 1-30 页，可按需修改起止页。`
-      : "暂未识别分页信息。点击刷新可自动刷新页面并重新读取统计。";
-  }
-
-  async function refreshStats() {
-    els.refreshStats.disabled = true;
-    try {
-      setStatus("正在刷新统计数据...");
-      if (!(await refreshActiveTabStatus())) return;
-      await prepareProductFilter();
-      const captured = await readCapture({ silent: true });
-      if (captured) {
-        setStatus("统计数据已刷新。");
-        return;
-      }
-      setStatus("已读取当前分页信息；尚未捕获评论响应。请点击创建并开始任务，不会刷新页面。");
-    } finally {
-      if (!isFetching) els.refreshStats.disabled = false;
-    }
-  }
-
-  async function ensureCaptureScript() {
-    setStatus("步骤 2/6：正在检查动态脚本注册 API...");
-    if (!chrome.scripting || typeof chrome.scripting.registerContentScripts !== "function") {
-      throw new Error("步骤 2/6 失败：当前浏览器不支持 chrome.scripting.registerContentScripts");
-    }
-    try {
-      const scripts = await chromeCall("scripting", "getRegisteredContentScripts", { ids: [captureScriptId] });
-      if (scripts && scripts.length) await chromeCall("scripting", "unregisterContentScripts", { ids: [captureScriptId] });
-    } catch (error) { throw stageError("步骤 2/6 检查旧监听", error); }
-    setStatus("步骤 2/6：正在注册 MAIN world 监听...");
-    try {
-      await chromeCall("scripting", "registerContentScripts", [{
-        id: captureScriptId,
-        matches: ratingPageMatches,
-        js: ["tiktok_capture_hook.js"],
-        runAt: "document_start",
-        world: "MAIN",
-        persistAcrossSessions: false
-      }]);
-    } catch (error) {
-      throw stageError("步骤 2/6 注册 MAIN world 监听（registerContentScripts）", error);
-    }
-    try {
-      const scripts = await chromeCall("scripting", "getRegisteredContentScripts", { ids: [captureScriptId] });
-      if (!scripts || !scripts.length) throw new Error("API 没有报错，但注册后查不到监听脚本");
-    } catch (error) {
-      throw stageError("步骤 2/6 验证监听注册结果（getRegisteredContentScripts）", error);
-    }
-  }
-  function waitForTabComplete(tabId) {
-    let cancel;
-    const promise = new Promise((resolve, reject) => {
-      let settled = false;
-      const timer = setTimeout(() => done(new Error("等待页面加载完成超过 30 秒")), 30000);
-      function done(error) {
-        if (settled) return;
-        settled = true;
-        clearTimeout(timer);
-        chrome.tabs.onUpdated.removeListener(listener);
-        chrome.tabs.onRemoved.removeListener(removedListener);
-        if (error) reject(error); else resolve();
-      }
-      function listener(updatedTabId, changeInfo) {
-        if (updatedTabId === tabId && changeInfo.status === "complete") done();
-      }
-      function removedListener(removedTabId) {
-        if (removedTabId === tabId) done(new Error("刷新过程中标签页被关闭"));
-      }
-      chrome.tabs.onUpdated.addListener(listener);
-      chrome.tabs.onRemoved.addListener(removedListener);
-      cancel = () => done(new Error("页面刷新已取消"));
-    });
-    promise.cancel = () => { if (cancel) cancel(); };
-    return promise;
-  }
-
-  async function verifyCaptureHook() {
-    let result;
-    try {
-      [result] = await executeScript({
-        target: { tabId: activeTabId },
-        world: "MAIN",
-        func: () => ({
-          hooked: window.__TK_REVIEW_CAPTURE_HOOKED__ === true,
-          mainWorld: !(typeof chrome !== "undefined" && chrome.runtime && chrome.runtime.id),
-          requestCount: window.__TK_REVIEW_CAPTURE__ && Array.isArray(window.__TK_REVIEW_CAPTURE__.requests)
-            ? window.__TK_REVIEW_CAPTURE__.requests.length : 0,
-          href: location.href,
-          userAgent: navigator.userAgent
-        })
-      });
-    } catch (error) {
-      throw stageError("步骤 5/6 MAIN world 健康检查（executeScript）", error);
-    }
-    const health = result && result.result;
-    if (!health || !health.hooked || !health.mainWorld) {
-      throw new Error(`步骤 5/6 失败：页面已刷新，但监听 hook 未进入 MAIN world。紫鸟可能未执行动态 MAIN world content script。页面：${health && health.href ? health.href : "未知"}`);
-    }
-    return health;
-  }
-  async function startCaptureAndRefresh() {
-    const captured = await installCaptureRefreshAndRead();
-    if (captured) {
-      setStatus(`监听已安装并读取到当前页：${rows.length} 条。`);
-    }
-  }
-
-  async function getCaptureSnapshot() {
-    const [result] = await executeScript({
-      target: { tabId: activeTabId },
-      world: "MAIN",
-      func: () => {
-        const capture = window.__TK_REVIEW_CAPTURE__ || { requests: [] };
-        return { ...capture, network: (capture.network || []).slice(-10), requests: (capture.requests || []).slice(-5).map(request => ({ ...request, responseText: request.responseJson ? "" : request.responseText })) };
-      }
-    });
-    return result && result.result ? result.result : { requests: [] };
-  }
-
-  async function productFilterCommand(command, target = lockedProductId) {
-    filterProbe = { ...filterProbe, command, commandTransport: "synchronous-poll", commandCompleted: false };
-    const jobId = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
-    const [started] = await executeScript({
-      target: { tabId: activeTabId }, world: "MAIN", args: [jobId, command, target, productInputDescriptor],
-      func: (id, command, target, saved) => {
-        if (typeof window.__TK_REVIEW_PRODUCT_FILTER__ !== "function") return { started: false, error: "商品搜索脚本未安装" };
-        const job = window.__TK_REVIEW_FILTER_JOB__ = { id, command, done: false, result: null, error: "" };
-        // Some Chromium shells serialize Promise objects without awaiting them.
-        // Keep the Promise in MAIN and return only synchronous plain objects.
-        Promise.resolve().then(() => window.__TK_REVIEW_PRODUCT_FILTER__(command, target, saved))
-          .then(result => { job.result = result; job.done = true; }, error => { job.error = error.message || String(error); job.done = true; });
-        return { started: true };
-      }
-    });
-    if (!started.result || !started.result.started) throw new Error(started.result && started.result.error || "商品搜索命令未启动，请运行诊断。");
-    for (let poll = 0; poll < 80; poll++) {
-      if (stopRequested) throw new Error("已停止商品搜索。");
-      const [snapshot] = await executeScript({ target: { tabId: activeTabId }, world: "MAIN", args: [jobId], func: id => {
-        const job = window.__TK_REVIEW_FILTER_JOB__;
-        return job && job.id === id ? { done: job.done, result: job.done ? job.result : null, error: job.error } : { error: "商品搜索状态已失效，页面可能已跳转" };
-      } });
-      const state = snapshot.result;
-      if (!state) throw new Error("商品搜索状态未返回，请运行诊断。");
-      if (state.error) throw new Error(state.error);
-      if (state.done) {
-        if (!state.result) throw new Error("商品搜索执行完成但没有有效结果，请运行诊断。");
-        filterProbe = { ...filterProbe, command, commandTransport: "synchronous-poll", commandCompleted: true };
-        return state.result;
-      }
-      await sleep(150);
-    }
-    throw new Error("商品搜索命令执行超时，已停止；不会刷新页面或改抓全店评论。");
-  }
-
-  async function loadProductFilter() {
-    await executeScript({ target: { tabId: activeTabId }, world: "MAIN", files: ["tiktok_product_filter.js"] });
-  }
-
-  async function prepareProductFilter() {
-    const entered = els.productSearchId.value.trim();
-    if (entered && !/^\d+$/.test(entered)) throw new Error("商品 / SKU ID 必须是完整数字编号；请勿使用科学计数法。");
-    lockedProductId = entered;
-    productInputDescriptor = null;
-    await loadProductFilter();
-    const inspected = await productFilterCommand("inspect", entered);
-    if (inspected.found) {
-      productInputDescriptor = inspected.descriptor;
-      if (!entered && inspected.value) {
-        lockedProductId = inspected.value;
-        els.productSearchId.value = inspected.value;
-      }
-    }
-    filterProbe = { fixed: !!lockedProductId, inputFound: !!inspected.found, descriptor: inspected.descriptor };
-  }
-
-  async function restoreProductFilter() {
-    if (!lockedProductId) return;
-    setStatus("正在恢复固定产品搜索条件，等待指定产品评论...");
-    await loadProductFilter();
-    for (let attempt = 0; attempt < 40; attempt++) {
-      if (stopRequested) throw new Error("已停止抓取。");
-      const applied = await productFilterCommand("apply");
-      if (applied.ready) {
-        productInputDescriptor = applied.descriptor;
-        filterProbe = { fixed: true, inputFound: true, trigger: applied.trigger, descriptor: applied.descriptor };
-        logDiagnostic("product-filter", `搜索条件已恢复，触发方式：${applied.trigger}`);
-        return;
-      }
-      await sleep(250);
-    }
-    throw new Error("刷新后无法找到商品搜索框，已停止以避免抓取全店评论。请运行诊断探针。");
-  }
-
-  function payloadMatchesProduct(payload, request) {
-    if (!lockedProductId) return true;
-    if (payload.list.length) {
-      return payload.list.every(item => {
-        const row = flattenReview(item);
-        return String(row.product_id) === lockedProductId || String(row.sku_id) === lockedProductId;
-      });
-    }
-    const text = `${request && request.url || ""} ${request && request.requestBody || ""}`;
-    return new RegExp(`(^|[^0-9])${lockedProductId}([^0-9]|$)`).test(text);
-  }
-
-  function requireProductPayload(payload) {
-    if (lockedProductId && !payloadMatchesProduct(payload)) throw new Error("返回评论不属于固定产品或缺少产品 ID，已停止以避免混入其他商品。请复制诊断报告。");
+    sentReplays.add(replayKey(spec.url, spec.body));
+    if (sentReplays.size > 500) sentReplays.delete(sentReplays.values().next().value);
+    const res = await hook("replay", spec);
+    if (!res || !res.status) throw kindError("retry", `接口请求失败：${res && res.error || "无响应"}`);
+    if (res.status === 401 || res.status === 403) throw kindError("fatal", `评论接口 HTTP ${res.status}：登录失效或无权限，请在页面重新登录后点“继续”。`);
+    if (res.status === 429) throw kindError("ratelimit", "评论接口限流（HTTP 429）");
+    if (res.status >= 400) throw kindError("retry", `评论接口 HTTP ${res.status}`);
+    const json = C.parseJson(res.text);
+    if (!json) throw kindError("api", "接口返回的不是 JSON（可能需要页面签名）");
+    const err = C.apiError(json);
+    if (err) throw kindError(/login|登录|auth|permission|权限/i.test(err) ? "fatal" : "api", err);
+    const payload = C.findReviewPayload(json);
+    if (!payload) throw kindError("api", "接口响应中没有评论列表");
     return payload;
   }
-
-  async function readCapture(options = {}) {
-    if (!(await refreshActiveTabStatus())) return null;
-    const capture = await getCaptureSnapshot();
-    const request = chooseReviewRequest(capture.requests || []);
-    if (!request) {
-      if (!options.silent) {
-        setStatus("还没有捕获到评论接口响应。点击“开始抓取评论”会自动安装监听并刷新。");
+  async function withRetry(fn) {
+    let lastError;
+    for (let attempt = 0; attempt < 4; attempt++) {
+      if (pauseRequested) throw kindError("paused", "已暂停");
+      try { return await fn(); }
+      catch (error) {
+        lastError = error;
+        if (error.kind === "ratelimit") { setStatus(`接口限流，等待 30 秒后重试（${attempt + 1}/3）…`); await pausableSleep(30000); continue; }
+        if (error.kind !== "retry" || attempt === 3) throw error;
+        setStatus(`${error.message}，${2 * (attempt + 1)} 秒后重试（${attempt + 1}/3）…`);
+        await pausableSleep(2000 * (attempt + 1));
       }
+    }
+    if (lastError && lastError.kind === "ratelimit") throw kindError("fatal", "评论接口持续限流，任务已暂停。请稍等几分钟后点“继续”，或调大“页间隔”。");
+    throw lastError;
+  }
+
+  // ---------------- 页面点击 ----------------
+  async function uiSearch(targetId) {
+    const before = (await hook("status")).seq;
+    const result = await hook("submitSearch", targetId ? String(targetId) : null);
+    if (!result || !result.ok) throw kindError(targetId ? "item" : "fatal", result && result.error || "无法在页面上提交搜索");
+    if (targetId && !result.valueKept) throw kindError("item", "页面搜索框没有保留输入的 ID。");
+    let mismatch = "";
+    const found = await waitForRecord(before, (record, payload) => {
+      const rows = payload.list.map(C.flattenReview);
+      if (!targetId) return true;
+      if (!rows.length) return payload.total === 0 ? true : "空列表但没有明确总数 0";
+      if (rows.every(row => C.rowMatchesProduct(row, targetId))) return true;
+      mismatch = "返回的评论不属于该 ID";
+      return mismatch;
+    }, 20000);
+    if (found.timeout) {
+      if (targetId) throw kindError("item", mismatch ? `页面搜索 ${targetId} 未生效：${mismatch}。已跳过，未采集全店评论。` : `搜索 ${targetId} 后没有捕获到评论接口响应（${found.reason || "超时"}）。`);
       return null;
     }
-    const payload = findReviewPayload(request.responseJson || parseJson(request.responseText));
-    if (!payload) {
-      if (!options.silent) setStatus("已捕获响应，但没有解析到评论列表。");
-      return null;
+    return found;
+  }
+  async function uiWaitAfter(before, prevSig, label) {
+    const found = await waitForRecord(before, (record, payload) => {
+      const sig = C.payloadSignature(payload.list.map(C.flattenReview));
+      return sig !== prevSig || !payload.list.length ? true : "与上一页相同";
+    }, 25000);
+    if (found.timeout) throw kindError("retry", `${label}后没有捕获到新的评论响应（${found.reason || "超时"}）`);
+    return found;
+  }
+  // 定位到当前商品/筛选的第 1 页，返回第 1 页响应
+  async function uiFirstPage(task, item) {
+    if (item.targetId) {
+      const found = await uiSearch(item.targetId);
+      if (task.config.driver !== "ui") {
+        const path = chooseProductPath(found.record, item.targetId);
+        if (path) {
+          setupTemplate(task, templateOf(found.record));
+          task.productPath = path;
+          await saveProductPath(task.template, path);
+          logEvent("info", `已从页面搜索学习商品参数：${path.join(".")}`);
+        } else logEvent("warn", "搜索请求中没有找到商品 ID 参数，后续使用页面点击翻页。");
+      }
+      return found;
     }
-    capturedRequest = request;
-    capturedPayload = payload;
-    rows = payload.list.map(flattenReview);
-    previewRows = rows.slice();
-    renderPageInfo(payload.total);
+    const info = await hook("paginationInfo");
+    if (info.activePage && info.activePage !== 1) {
+      const before = (await hook("status")).seq;
+      const r = await hook("clickPage", 1);
+      if (!r.ok) throw kindError("fatal", r.error);
+      return uiWaitAfter(before, "\u0000", "跳转第 1 页");
+    }
+    const found = await uiSearch(null).catch(error => { if (error.kind === "paused") throw error; logEvent("warn", `重新提交查询失败：${error.message}`); return null; });
+    if (found) return found;
+    const latest = await hook("latest", false);
+    if (latest) { const { payload } = parseRecord(latest); if (payload) return { record: latest, payload }; }
+    throw kindError("fatal", "无法获取第 1 页数据：请在页面上点一次“查询”或翻一页后重试。");
+  }
+  async function uiReadPage(task, item, page, prevSig, ctx) {
+    if (!ctx.positioned) {
+      const first = await uiFirstPage(task, item);
+      ctx.positioned = true;
+      ctx.uiPage = 1;
+      if (page === 1) return first.payload;
+      prevSig = C.payloadSignature(first.payload.list.map(C.flattenReview));
+      setStatus(`页面点击：跳转到第 ${page} 页…`);
+      const before = (await hook("status")).seq;
+      const jump = await hook("clickPage", page);
+      if (jump.ok) {
+        const found = await uiWaitAfter(before, prevSig, `跳转第 ${page} 页`);
+        const info = await hook("paginationInfo");
+        if (!info.activePage || info.activePage === page) { ctx.uiPage = page; return found.payload; }
+      }
+      // 逐页点击到目标页（不保存中间页）
+      let payload = first.payload;
+      for (let p = (await hook("paginationInfo")).activePage || 1; p < page; p++) {
+        if (pauseRequested) throw kindError("paused", "已暂停");
+        const b = (await hook("status")).seq;
+        const next = await hook("clickNext");
+        if (!next.ok) return { list: [], total: payload.total, nextCursor: "", hasMore: false };
+        payload = (await uiWaitAfter(b, C.payloadSignature(payload.list.map(C.flattenReview)), `翻到第 ${p + 1} 页`)).payload;
+      }
+      ctx.uiPage = page;
+      return payload;
+    }
+    const before = (await hook("status")).seq;
+    const next = await hook("clickNext");
+    if (!next.ok) return { list: [], total: null, nextCursor: "", hasMore: false, end: true };
+    const found = await uiWaitAfter(before, prevSig, `点击下一页（第 ${page} 页）`);
+    ctx.uiPage = page;
+    return found.payload;
+  }
+
+  // ---------------- 任务执行 ----------------
+  function decideDriver(task, item) {
+    if (task.config.driver === "ui") return "ui";
+    const ready = task.template && task.pagination && task.pagination.kind && (!item.targetId || task.productPath);
+    if (!ready) {
+      if (task.config.driver === "api" && task.template && !task.pagination.kind) throw kindError("fatal", "接口请求中没有识别到分页参数，无法使用“仅接口直连”，请改为“自动”。");
+      return "ui";
+    }
+    return "api";
+  }
+  function summarize(task) {
+    const rows = task.rowCount || 0;
+    const images = task.imageCount || 0;
+    els.statRows.textContent = String(rows);
+    els.statImages.textContent = String(images);
+    els.statDriver.textContent = task.driverUsed === "api" ? "接口直连" : task.driverUsed === "ui" ? "页面点击" : "-";
+    const item = task.items[Math.min(task.index || 0, task.items.length - 1)];
+    els.statTotal.textContent = item && item.total != null ? String(item.total) : "-";
+    const doneItems = task.items.filter(i => i.status === "done" || i.status === "empty").length;
+    if (task.items.length > 1) {
+      els.progress.max = task.items.length; els.progress.value = doneItems;
+    } else if (item) {
+      const totalPages = task.config.endPage ? Math.min(task.config.endPage, item.totalPages || task.config.endPage) : item.totalPages;
+      els.progress.max = Math.max(1, (totalPages || item.nextPage) - task.config.startPage + 1);
+      els.progress.value = Math.max(0, item.nextPage - task.config.startPage);
+    }
+  }
+  function pushPreview(records) {
+    preview.push(...records);
+    if (preview.length > 50) preview = preview.slice(-50);
     renderPreview();
-    els.nextCursor.textContent = payload.nextCursor ? `下一页游标：${payload.nextCursor}` : "";
-    setProgress(1, 1);
-    setStatus(`已读取当前页数据：${rows.length} 条${payload.total ? `，总数 ${payload.total}` : ""}。`);
-    return { request, payload };
   }
 
-  async function installCaptureRefreshAndRead() {
-    setStatus("步骤 1/6：正在查找 /product/rating 商品评价页...");
-    if (!(await refreshActiveTabStatus())) throw new Error("步骤 1/6 失败：未找到路径为 /product/rating 的商品评价标签页");
-    lockedTabId = activeTabId;
-    await prepareProductFilter();
-    await ensureCaptureScript();
-    setStatus(`步骤 3/6：监听注册成功，准备刷新标签页 ${activeTabId}...`);
-    const completePromise = waitForTabComplete(activeTabId);
-    completePromise.catch(() => {});
-    try {
-      await chromeCall("tabs", "reload", activeTabId);
-    } catch (error) {
-      completePromise.cancel();
-      throw stageError("步骤 3/6 刷新标签页（chrome.tabs.reload）", error);
-    }
-    setStatus("步骤 4/6：刷新命令已发送，正在等待页面加载完成...");
-    await completePromise;
-    setStatus("步骤 5/6：页面加载完成，正在检查 MAIN world 监听...");
-    const health = await verifyCaptureHook();
-    await restoreProductFilter();
-    setStatus(`步骤 6/6：监听正常，已暂存 ${health.requestCount} 个响应，正在等待评论接口...`);
-    return await waitForInitialCapture();
-  }
-  async function waitForInitialCapture() {
-    for (let i = 0; i < 40; i++) {
-      if (stopRequested) throw new Error("已停止抓取。");
-      const captured = await readCapture({ silent: true });
-      if (captured) return captured;
-      await sleep(500);
-    }
-    throw new Error(lockedProductId
-      ? "步骤 6/6 超时：未收到能确认属于固定产品的评论响应。可能是搜索未生效或响应缺少产品 ID；已阻止抓取全店数据，请复制诊断报告。"
-      : "步骤 6/6 超时：监听已进入 MAIN world，但 20 秒内没有捕获到评论接口响应。可能是接口字段变化，或紫鸟限制了 fetch/XHR hook。");
-  }
-
-  function parseJson(text) {
-    try {
-      return JSON.parse(text);
-    } catch (error) {
-      return null;
-    }
-  }
-
-  function chooseReviewRequest(requests) {
-    const candidates = requests
-      .map(request => ({ request, payload: findReviewPayload(request.responseJson || parseJson(request.responseText)) }))
-      .filter(item => item.payload && (!item.request.status || (item.request.status >= 200 && item.request.status < 300)) && (item.payload.list.length || /review|rating/i.test(item.request.url || "")) && payloadMatchesProduct(item.payload, item.request));
-    if (!candidates.length) return null;
-    candidates.sort((a, b) => {
-      return Number(b.request.sequence || 0) - Number(a.request.sequence || 0) || Number(b.request.capturedAt || 0) - Number(a.request.capturedAt || 0);
-    });
-    return candidates[0].request;
-  }
-
-  function findReviewPayload(root) {
-    const seen = new Set();
-    const queue = [root];
-    while (queue.length) {
-      const value = queue.shift();
-      if (!value) continue;
-      if (typeof value === "string") {
-        const parsed = parseJson(value);
-        if (parsed) queue.push(parsed);
-        continue;
-      }
-      if (typeof value !== "object") continue;
-      if (seen.has(value)) continue;
-      seen.add(value);
-
-      const data = value.data && typeof value.data === "object" ? value.data : value;
-      const listKey = ["list", "reviews", "review_list", "reviewList"].find(key => Array.isArray(data[key]) && data[key].some(looksLikeReview));
-      const explicitTotal = data.total ?? data.total_count ?? value.total;
-      const emptyKey = ["list", "reviews", "review_list", "reviewList"].find(key => Array.isArray(data[key]) && data[key].length === 0 && explicitTotal !== null && explicitTotal !== undefined && String(explicitTotal).trim() !== "" && Number(explicitTotal) === 0);
-      if (listKey || emptyKey) {
-        return {
-          list: data[listKey || emptyKey],
-          total: Number(data.total ?? data.total_count ?? value.total ?? 0),
-          nextCursor: data.next_cursor || data.nextCursor || data.cursor || value.next_cursor || ""
-        };
-      }
-
-      if (Array.isArray(value)) {
-        queue.push(...value);
+  async function runItem(task, item, itemIndex) {
+    const ctx = { positioned: false, apiOk: 0, apiFailed: false, variant: 0 };
+    const sizeOf = () => item.sizeOverride || task.sizeUsed;
+    let mode = decideDriver(task, item);
+    let prevSig = item.lastSig || "";
+    let pagesThisRun = 0;
+    item.status = "running";
+    const label = item.targetId ? `商品 ${item.targetId}` : "当前筛选";
+    while (true) {
+      if (pauseRequested) throw kindError("paused", "已暂停");
+      const page = item.nextPage;
+      if (task.config.endPage && page > task.config.endPage) break;
+      if (page > 20000) break;
+      task.driverUsed = mode;
+      setStatus(`${label}：正在采集第 ${page} 页${item.totalPages ? ` / ${item.totalPages}` : ""}（${mode === "api" ? "接口直连" : "页面点击"}）…`);
+      let payload;
+      if (mode === "api") {
+        try {
+          // 纯光标翻页且从中间开始时，先顺序走到目标页（不保存）
+          if (task.pagination.kind === "cursor" && !task.pagination.pagePath && page > 1 && !item.cursor) {
+            for (let p = 1; p < page; p++) item.cursor = (await withRetry(() => apiFetchPage(task, item, p))).nextCursor;
+          }
+          payload = await withRetry(() => apiFetchPage(task, item, page));
+          const rows = payload.list.map(C.flattenReview);
+          if (item.targetId && rows.some(row => !C.rowMatchesProduct(row, item.targetId))) throw kindError("api", "接口返回了其他商品的评论（商品参数未生效）");
+          if (rows.length && C.payloadSignature(rows) === prevSig) throw kindError("api", "接口翻页参数未生效（与上一页相同）");
+          if (!rows.length && page === 1 && payload.total !== 0 && payload.total !== null) throw kindError("api", "接口第 1 页为空但总数不为 0");
+          // 服务器可能限制每页条数：以实际返回为准，避免误判为最后一页
+          if (ctx.apiOk === 0 && sizeOf() && rows.length < sizeOf() && payload.total && payload.total > (page - 1) * sizeOf() + rows.length) {
+            logEvent("warn", `接口每页实际返回 ${rows.length} 条（请求 ${sizeOf()} 条），按 ${rows.length} 条继续。`);
+            if (item.sizeOverride) item.sizeOverride = rows.length; else task.sizeUsed = rows.length;
+            if (page > 1) { continue; } // 页码含义随条数变化，重新请求本页
+          }
+          ctx.apiOk++;
+        } catch (error) {
+          if (error.kind === "fatal" || error.kind === "paused") throw error;
+          // 首页失败时依次尝试：去除签名参数 → 页面原每页条数 → 两者同时
+          if (ctx.apiOk === 0 && error.kind !== "ratelimit") {
+            if (ctx.canResize === undefined) ctx.canResize = !!(task.pagination.pageSize && sizeOf() !== task.pagination.pageSize);
+            const variants = [{ strip: true }, { strip: false, resize: true }, { strip: true, resize: true }].filter(v => !v.resize || ctx.canResize);
+            if (ctx.variant < variants.length) {
+              const v = variants[ctx.variant++];
+              task.stripSign = v.strip;
+              if (v.resize) { task.sizeUsed = task.pagination.pageSize; item.sizeOverride = 0; }
+              logEvent("warn", `接口直连失败（${error.message}），改为${v.strip ? "去除签名参数" : "保留签名参数"}${v.resize ? `、每页 ${task.sizeUsed} 条` : ""}重试。`);
+              continue;
+            }
+          }
+          if (task.config.driver === "api") throw error;
+          logEvent("warn", `接口直连不可用（${error.message}），切换为页面点击翻页。`);
+          task.stripSign = false;
+          mode = "ui"; ctx.positioned = false; ctx.apiFailed = true;
+          if (item.pages && task.pagination.pageSize && sizeOf() && sizeOf() !== task.pagination.pageSize && task.config.startPage === 1) {
+            // 接口与页面每页条数不同，页码无法对应：页面点击从第 1 页重新采集（按评论 ID 去重）
+            item.nextPage = 1; item.cursor = ""; item.lastSig = prevSig = ""; item.pages = 0;
+          }
+          if (item.targetId) task.productPath = null; // 商品参数可能有误，由页面搜索重新学习
+          continue;
+        }
       } else {
-        for (const key of Object.keys(value)) queue.push(value[key]);
+        let attempt = 0;
+        while (true) {
+          try { payload = await uiReadPage(task, item, page, prevSig, ctx); break; }
+          catch (error) {
+            if (error.kind !== "retry" || attempt >= 2) throw error;
+            attempt++; ctx.positioned = false;
+            setStatus(`${error.message}，重新定位后重试（${attempt}/2）…`);
+            await pausableSleep(2000);
+          }
+        }
+        if (item.targetId && payload.list.map(C.flattenReview).some(row => !C.rowMatchesProduct(row, item.targetId))) {
+          throw kindError("item", `页面返回了其他商品的评论，已停止采集 ${item.targetId}，避免混入全店评论。`);
+        }
       }
+
+      // 保存（评论与进度同一事务；失败则回滚内存中的进度）
+      const rows = payload.list.map(C.flattenReview);
+      const backup = JSON.stringify({ item, rowCount: task.rowCount, imageCount: task.imageCount });
+      if (payload.total !== null && payload.total !== undefined) item.total = payload.total;
+      if (!item.firstPageSize && rows.length) item.firstPageSize = rows.length;
+      const perPage = mode === "api" && sizeOf() ? sizeOf() : Math.max(item.firstPageSize || 0, rows.length);
+      if (item.total && perPage) item.totalPages = Math.ceil(item.total / perPage);
+      item.nextPage = page + 1;
+      item.cursor = payload.nextCursor || "";
+      if (rows.length) { item.lastSig = prevSig = C.payloadSignature(rows); item.pages = (item.pages || 0) + 1; }
+      const records = rows.map((row, i) => ({ key: C.rowKey(row), targetId: item.targetId, page, order: itemIndex * 1e9 + page * 1000 + i, row }));
+      try {
+        const added = rows.length ? await store.savePage(task, records) : (await store.putTask(task), 0);
+        item.rows = (item.rows || 0) + added;
+      } catch (error) {
+        const saved = JSON.parse(backup);
+        Object.assign(item, saved.item); task.rowCount = saved.rowCount; task.imageCount = saved.imageCount;
+        throw kindError("fatal", `本地保存失败：${error.message}`);
+      }
+      pushPreview(records);
+      summarize(task);
+      pagesThisRun++;
+
+      // 结束判断
+      let end = !rows.length || payload.end || payload.hasMore === false || (task.config.endPage && page >= task.config.endPage);
+      if (mode === "api") {
+        end = end || (item.total != null && perPage && page * perPage >= item.total) ||
+          (sizeOf() && rows.length < sizeOf()) ||
+          (task.pagination.kind === "cursor" && !task.pagination.pagePath && !payload.nextCursor);
+      }
+      if (end) break;
+
+      // 页面搜索学到商品参数后，切回接口直连（除非接口刚失败过）
+      if (mode === "ui" && task.config.driver === "auto" && !ctx.apiFailed && task.template && task.pagination && task.pagination.kind && (!item.targetId || task.productPath)) {
+        mode = "api";
+        const uiSize = item.firstPageSize || rows.length;
+        if (task.sizeUsed && uiSize && task.sizeUsed !== uiSize) {
+          if (task.config.startPage === 1) {
+            // 页面每页条数与接口不同，页码不能对应：从第 1 页按接口条数重新采集（按评论 ID 去重，不会重复）
+            item.nextPage = 1; item.cursor = ""; item.lastSig = prevSig = ""; item.pages = 0;
+            logEvent("info", `已获得接口模板，改用接口直连并按每页 ${task.sizeUsed} 条从第 1 页重新采集（自动去重）。`);
+          } else {
+            item.sizeOverride = uiSize;
+            logEvent("info", `已获得接口模板，后续页改用接口直连（沿用页面每页 ${uiSize} 条以保持页码一致）。`);
+          }
+        } else logEvent("info", "已获得接口模板，后续页改用接口直连。");
+      }
+
+      // 分批：每批结束稍作休息
+      if (pagesThisRun % task.config.batchSize === 0) {
+        setStatus(`${label}：本轮第 ${pagesThisRun / task.config.batchSize} 批（${task.config.batchSize} 页）已采完，已保存 ${task.rowCount || 0} 条，稍候继续…`);
+        await pausableSleep(3000);
+      } else await pausableSleep(task.config.delayMs);
     }
-    return null;
+    item.status = item.rows || item.pages ? "done" : "empty";
+    item.error = "";
   }
 
-  function looksLikeReview(item) {
-    return !!item && typeof item === "object" && (
-      item.star_level !== undefined ||
-      item.review_text !== undefined ||
-      item.main_review_id !== undefined
-      || item.starLevel !== undefined || item.reviewText !== undefined || item.mainReviewId !== undefined
-      || (item.rating !== undefined && (item.review_id !== undefined || item.reviewId !== undefined || item.content !== undefined))
-    );
-  }
-
-  function pick(item, keys) {
-    for (const key of keys) {
-      if (item && item[key] !== undefined && item[key] !== null) return item[key];
+  async function runTask(task) {
+    running = task; pauseRequested = false; busy = true; controls();
+    clearError(); preview = []; renderPreview();
+    task.status = "running"; task.lastError = "";
+    await store.putTask(task);
+    try {
+      await useTab(false);
+      const status = await ensureHook();
+      logEvent("info", `页面监听：v${status.version}，已捕获 ${status.records} 条评论响应${status.lateInstall ? "（补注入）" : ""}`);
+      for (let i = task.index || 0; i < task.items.length; i++) {
+        task.index = i;
+        const item = task.items[i];
+        if (item.status === "done" || item.status === "empty") continue;
+        try {
+          await runItem(task, item, i);
+        } catch (error) {
+          if (error.kind === "item" && task.items.length > 1) {
+            item.status = "error"; item.error = error.message;
+            logEvent("warn", error.message);
+          } else throw error;
+        }
+        await store.putTask(task);
+        summarize(task);
+        if (i < task.items.length - 1) await pausableSleep(task.config.delayMs);
+        if (pauseRequested) throw kindError("paused", "已暂停");
+      }
+      task.status = "done";
+      task.index = task.items.length;
+      const failed = task.items.filter(i => i.status === "error");
+      setStatus(`完成：共 ${task.rowCount || 0} 条评论，${task.imageCount || 0} 张评价图${failed.length ? `；${failed.length} 个 ID 失败（见“导出 Excel”的商品汇总）` : ""}。`);
+    } catch (error) {
+      if (error.kind === "paused") { task.status = "paused"; setStatus(`已暂停：已保存 ${task.rowCount || 0} 条。点“继续”从断点接着采集。`); }
+      else {
+        task.status = "error"; task.lastError = error.message;
+        const item = task.items[task.index || 0];
+        if (item && item.status === "running") item.status = "pending";
+        showError(error);
+      }
+    } finally {
+      await store.putTask(task).catch(() => {});
+      running = null; busy = false; pauseRequested = false;
+      selectedId = task.id;
+      await refreshTaskList();
+      controls();
     }
-    return "";
   }
 
-  function flattenReview(item) {
-    const info = item && (item.product_info || item.productInfo);
-    const productInfo = info && typeof info === "object" ? info : {};
-    const media = window.TKReviewTasks ? window.TKReviewTasks.extractImages(item) : { images: [] };
+  // ---------------- 创建任务 ----------------
+  function readForm() {
+    const mode = document.querySelector("input[name=mode]:checked").value;
+    const num = (el, def, min, max) => { const v = parseInt(el.value, 10); return Number.isFinite(v) ? Math.min(max, Math.max(min, v)) : def; };
     return {
-      star_level: pick(item, ["star_level", "starLevel", "rating"]),
-      review_text: pick(item, ["review_text", "reviewText", "content"]),
-      reply_text: pick(item, ["reply_text", "replyText"]),
-      reply_count: pick(item, ["reply_count", "replyCount"]),
-      main_review_id: pick(item, ["main_review_id", "mainReviewId", "review_id", "reviewId"]),
-      order_id: pick(item, ["order_id", "orderId"]),
-      product_id: pick(productInfo, ["product_id", "productId"]) || pick(item, ["product_id", "productId"]),
-      product_name: pick(productInfo, ["product_name", "productName"]) || pick(item, ["product_name", "productName"]),
-      sku_id: pick(productInfo, ["sku_id", "skuId"]) || pick(item, ["sku_id", "skuId"]),
-      sku_specification: pick(productInfo, ["sku_specification", "skuSpecification"]) || pick(item, ["sku_specification", "skuSpecification"]),
-      user_name: pick(item, ["user_name", "userName", "buyer_name", "buyerName", "display_name"]),
-      create_time: formatReviewTime(pick(item, ["create_time", "createTime", "ctime", "review_time"])),
-      review_image_count: media.images.length, review_image_urls: media.images.map(image => image.url).join("\n"), review_images: media.images
+      mode,
+      ids: els.productIds.value,
+      startPage: num(els.startPage, 1, 1, 100000),
+      endPage: els.endPage.value.trim() ? num(els.endPage, 0, 1, 100000) : 0,
+      pageSize: num(els.pageSize, 50, 1, 100),
+      batchSize: num(els.batchSize, 50, 1, 1000),
+      delayMs: num(els.delayMs, 600, 0, 10000),
+      driver: els.driver.value
     };
   }
-
-  function formatReviewTime(value) {
-    if (value === undefined || value === null || value === "") return "";
-    const text = String(value).trim();
-    if (!/^\d+$/.test(text)) return text;
-    const number = Number(text);
-    if (!Number.isFinite(number) || number <= 0) return text;
-    const ms = number > 100000000000 ? number : number * 1000;
-    const date = new Date(ms);
-    if (Number.isNaN(date.getTime())) return text;
-    const pad = part => String(part).padStart(2, "0");
-    return [
-      date.getFullYear(),
-      pad(date.getMonth() + 1),
-      pad(date.getDate())
-    ].join("-") + " " + [
-      pad(date.getHours()),
-      pad(date.getMinutes()),
-      pad(date.getSeconds())
-    ].join(":");
-  }
-
-  function parseOptionalPositiveInteger(input) {
-    const text = (input.value || "").trim();
-    if (!text) return 0;
-    const value = parseInt(text, 10);
-    return Number.isFinite(value) && value > 0 ? value : 0;
-  }
-
-  function getPagePlan() {
-    const maxPages = Number(pageInfo.totalPages || 0);
-    const rawStart = parseOptionalPositiveInteger(els.pageStart);
-    const rawEnd = parseOptionalPositiveInteger(els.pageEnd);
-    let startPage = rawStart || 1;
-    let endPage = rawEnd || startPage;
-
-    if (maxPages) {
-      startPage = Math.min(startPage, maxPages);
-      endPage = Math.min(endPage, maxPages);
+  async function createTask() {
+    clearError();
+    const form = readForm();
+    let ids = [""];
+    if (form.mode === "ids") {
+      ids = window.TKProductImport.text(form.ids);
     }
-
-    if (endPage < startPage) {
-      throw new Error("终止页不能小于起始页。");
-    }
-
-    const pageCount = endPage - startPage + 1;
-    return { startPage, endPage, pageCount };
-  }
-
-  async function fetchPages() {
-    clearData();
-    const current = await installCaptureRefreshAndRead();
-    if (!current) return;
-    if (!current.payload.list.length) { setStatus("当前筛选条件下没有评论。"); return; }
-    if (pageInfo.currentPage > 1) throw new Error(`刷新后页面仍在第 ${pageInfo.currentPage} 页，请手动切到第 1 页后重新开始，避免页码错位。`);
-    const plan = getPagePlan();
-    const { startPage, endPage, pageCount } = plan;
-
-    rows = [];
-    previewRows = [];
-    let cursor = current.payload.nextCursor || "";
-    // savedCursors[i] = cursor that leads to page i+2, used for replay-based retry
-    const savedCursors = [];
-    savedCursors[0] = cursor;
-    let activePayload = current.payload;
-    if (startPage > 1) {
-      setStatus(`正在跳转到起始页 ${startPage}...`);
-      activePayload = await refreshAndNavigateToPage(startPage, current.request, savedCursors);
-      if (!activePayload || !activePayload.list.length) {
-        setStatus(`未能获取起始页 ${startPage} 的数据。`);
-        return;
-      }
-      cursor = activePayload.nextCursor || "";
-      savedCursors[startPage - 1] = cursor;
-    }
-
-    requireProductPayload(activePayload);
-    rows = activePayload.list.map(flattenReview);
-    previewRows = rows.slice();
-    setProgress(1, pageCount);
-    renderPreview();
-    let lastSignature = getPayloadSignature(activePayload);
-    const seenSignatures = new Set([lastSignature]);
-    let completedPages = 1;
-
-    for (let page = startPage + 1; page <= endPage; page++) {
-      if (stopRequested) { setStatus(`已停止。共抓取 ${rows.length} 条，${completedPages} 页。`); break; }
-      const progressPage = page - startPage + 1;
-      setStatus(`正在抓取第 ${page} 页（${progressPage} / ${pageCount}）...`);
-      let payload = await clickNextAndWaitForPayload(lastSignature);
-      if (payload && seenSignatures.has(getPayloadSignature(payload))) payload = null;
-      if (stopRequested) { setStatus(`已停止。共抓取 ${rows.length} 条，${completedPages} 页。`); break; }
-
-      // Fallback 1: direct API replay using cursor
-      if ((!payload || !payload.list.length) && cursor) {
-        try {
-          const json = await replayRequest(current.request, cursor);
-          payload = findReviewPayload(json);
-        } catch (e) { logDiagnostic("replay-error", errorText(e)); }
-      }
-
-      // Fallback 2: refresh + navigate back to this page
-      if (stopRequested) { setStatus(`已停止。共抓取 ${rows.length} 条，${completedPages} 页。`); break; }
-      if (!payload || !payload.list.length || seenSignatures.has(getPayloadSignature(payload))) {
-        setStatus(`第 ${page} 页数据为空，刷新后重新导航到该页...`);
-        payload = await refreshAndNavigateToPage(page, current.request, savedCursors);
-      }
-
-      if (!payload || !payload.list.length || seenSignatures.has(getPayloadSignature(payload))) {
-        setStatus(`已停止在第 ${page - 1} 页：重试后仍无数据。`);
-        break;
-      }
-      requireProductPayload(payload);
-      lastSignature = getPayloadSignature(payload);
-      seenSignatures.add(lastSignature);
-      rows.push(...payload.list.map(flattenReview));
-      cursor = payload.nextCursor || "";
-      savedCursors[page - 1] = cursor;
-      els.nextCursor.textContent = cursor ? `下一页游标：${cursor}` : "";
-      completedPages = progressPage;
-      setProgress(progressPage, pageCount);
-      updateResultMeta();
-      setStatus(`正在抓取第 ${page} 页（${progressPage} / ${pageCount}），已抓取 ${rows.length} 条...`);
-
-      if (stopRequested) {
-        setStatus(`已停止。共抓取 ${rows.length} 条，${completedPages} 页。`);
-        break;
-      }
-    }
-
-    if (!stopRequested && completedPages >= pageCount) {
-      setStatus(`完成。已抓取 ${rows.length} 条，页码 ${startPage}-${endPage}，共 ${completedPages} 页。`);
-    }
-  }
-
-  // When a page returns empty, try strategies in order:
-  // 1. Direct API replay with saved cursor (instant)
-  // 2. Refresh + jump via pagination "..." buttons (fast, one API call)
-  // 3. Refresh + click Next one at a time (slow fallback)
-  async function refreshAndNavigateToPage(targetPage, originalRequest, savedCursors) {
-    // Strategy 1: replay the API call directly using the saved cursor
-    const prevCursor = savedCursors[targetPage - 2];
-    if (prevCursor && originalRequest) {
-      try {
-        setStatus(`第 ${targetPage} 页重试：直接请求接口...`);
-        const json = await replayRequest(originalRequest, prevCursor);
-        const payload = findReviewPayload(json);
-        if (payload && payload.list.length) return payload;
-      } catch (e) { logDiagnostic("replay-error", errorText(e)); }
-    }
-
-    // Strategy 2 & 3: refresh and navigate
-    setStatus(`第 ${targetPage} 页重试：刷新页面...`);
-    if (!(await refreshActiveTabStatus())) return null;
-    await ensureCaptureScript();
-    const completePromise = waitForTabComplete(activeTabId);
-    completePromise.catch(() => {});
-    try { await chromeCall("tabs", "reload", activeTabId); }
-    catch (error) { completePromise.cancel(); throw error; }
-    await completePromise;
-    await verifyCaptureHook();
-    await restoreProductFilter();
-    await detectPageInfo();
-    if (!lockedProductId && pageInfo.currentPage > 1) {
-      logDiagnostic("pagination-error", `刷新后仍在第 ${pageInfo.currentPage} 页，停止以避免错页。`);
-      return null;
-    }
-
-    // Wait for page 1 data
-    let p1Payload = null;
-    for (let i = 0; i < 40; i++) {
-      if (stopRequested) return null;
-      const snapshot = await getCaptureSnapshot();
-      const req = chooseReviewRequest(snapshot.requests || []);
-      if (req) {
-        const pl = findReviewPayload(req.responseJson || parseJson(req.responseText));
-        if (pl && pl.list.length) { p1Payload = pl; break; }
-      }
-      await sleep(500);
-    }
-    if (!p1Payload) return null;
-    await detectPageInfo();
-    if (pageInfo.currentPage > 1) throw new Error("恢复产品筛选后未回到第 1 页，已停止以避免错页。");
-    if (targetPage === 1) return p1Payload;
-
-    // Strategy 2: use "..." jump buttons to reach target page quickly.
-    // Clicking "..." just shifts the visible page window (no API call).
-    // Only clicking the actual page number triggers an API call.
-    setStatus(`第 ${targetPage} 页重试：通过分页按钮快速跳转...`);
-    const beforeJump = Date.now();
-    const jumped = await jumpToPageViaUI(targetPage);
-    if (jumped) {
-      for (let i = 0; i < 30; i++) {
-        if (stopRequested) return null;
-        await sleep(500);
-        const payloads = await getCapturedPayloadsAfter(beforeJump);
-        if (payloads.length) return payloads[payloads.length - 1];
-      }
-      // The UI may already be on targetPage. Do not advance from an unknown page.
-      logDiagnostic("pagination-error", "页码跳转后未捕获响应，停止导航以避免错页。");
-      return null;
-    }
-
-    // Strategy 3: click Next one at a time (reliable but slow)
-    setStatus(`第 ${targetPage} 页重试：逐页前进（第 2 → ${targetPage} 页）...`);
-    let lastSig = getPayloadSignature(p1Payload);
-    let payload = null;
-    for (let p = 2; p <= targetPage; p++) {
-      setStatus(`重试导航：第 ${p} / ${targetPage} 页...`);
-      payload = await clickNextAndWaitForPayload(lastSig);
-      if (!payload) return null;
-      lastSig = getPayloadSignature(payload);
-    }
-    return payload;
-  }
-
-  // Click the "..." ellipsis buttons repeatedly to shift the visible page window,
-  // then click the target page number. No API calls until the final click.
-  async function jumpToPageViaUI(targetPage) {
-    for (let attempt = 0; attempt < Math.min(2500, Math.ceil(targetPage / 4) + 50); attempt++) {
-      if (stopRequested) return false;
-      const [result] = await executeScript({
-        target: { tabId: activeTabId },
-        world: "MAIN",
-        args: [targetPage],
-        func: (targetPage) => {
-          window.__TK_REVIEW_EXPECT_PAGE__ = null;
-          const jumper = document.querySelector(".core-pagination-jumper input, .core-pagination-simple input, input[aria-label='Go to page']");
-          if (jumper && jumper.getBoundingClientRect().width > 0) {
-            window.__TK_REVIEW_EXPECT_PAGE__ = { page: targetPage };
-            Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value").set.call(jumper, String(targetPage));
-            jumper.dispatchEvent(new Event("input", { bubbles: true }));
-            jumper.dispatchEvent(new Event("change", { bubbles: true }));
-            jumper.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", code: "Enter", keyCode: 13, which: 13, bubbles: true }));
-            return "clicked";
-          }
-          const items = Array.from(document.querySelectorAll(".core-pagination-item"));
-
-          // If target page number is visible, click it
-          const targetEl = items.find(el => {
-            const n = parseInt((el.textContent || "").trim(), 10);
-            const rect = el.getBoundingClientRect();
-            return n === targetPage && rect.width > 0;
-          });
-          if (targetEl) {
-            window.__TK_REVIEW_EXPECT_PAGE__ = { page: targetPage };
-            targetEl.click();
-            return "clicked";
-          }
-
-          // Determine direction
-          const nums = items
-            .map(el => parseInt((el.textContent || "").trim(), 10))
-            .filter(n => Number.isFinite(n) && n > 0);
-          if (!nums.length) return "no-items";
-
-          const current = document.querySelector(".core-pagination-item-active, [aria-current='page']");
-          const currentPage = current ? parseInt(current.textContent, 10) : nums[Math.floor(nums.length / 2)];
-
-          if (targetPage > currentPage) {
-            // Find the forward "..." jump button
-            const jumpNext =
-              document.querySelector(".core-pagination-item-jump-next") ||
-              items.find(el => /jump.?next/i.test(String(el.className || "")));
-            if (jumpNext) {
-              jumpNext.dispatchEvent(new MouseEvent("mouseenter", { bubbles: true }));
-              jumpNext.click();
-              return "jump-next";
-            }
-            return "no-jump-next";
-          }
-
-          if (targetPage < currentPage) {
-            const jumpPrev =
-              document.querySelector(".core-pagination-item-jump-prev") ||
-              items.find(el => /jump.?prev/i.test(String(el.className || "")));
-            if (jumpPrev) {
-              jumpPrev.dispatchEvent(new MouseEvent("mouseenter", { bubbles: true }));
-              jumpPrev.click();
-              return "jump-prev";
-            }
-            return "no-jump-prev";
-          }
-
-          return "unknown";
-        }
-      });
-
-      const action = result && result.result;
-      if (action === "clicked") return true;
-      if (!action || action === "no-items" || action === "no-jump-next" || action === "no-jump-prev") return false;
-      // "jump-next" / "jump-prev" just re-renders the DOM — no API call, so minimal delay
-      await sleep(150);
-    }
-    return false;
-  }
-
-  function getPayloadSignature(payload) {
-    if (!payload || !payload.list || !payload.list.length) return "";
-    const first = flattenReview(payload.list[0]);
-    const last = flattenReview(payload.list[payload.list.length - 1]);
-    return [
-      payload.nextCursor || "",
-      first.main_review_id || "",
-      last.main_review_id || "",
-      payload.list.length
-    ].join("|");
-  }
-
-  async function clickNextAndWaitForPayload(lastSignature) {
-    const beforeTime = Date.now();
-    const clicked = await clickNextPage();
-    if (!clicked) return null;
-
-    for (let i = 0; i < 30; i++) {
-      if (stopRequested) return null;
-      await sleep(500);
-      const payloads = await getCapturedPayloadsAfter(beforeTime);
-      for (let index = payloads.length - 1; index >= 0; index--) {
-        const payload = payloads[index];
-        const signature = getPayloadSignature(payload);
-        if (signature && signature !== lastSignature) {
-          return payload;
+    if (form.endPage && form.endPage < form.startPage) throw new Error("终止页不能小于起始页。");
+    setStatus("正在检查评价页与页面监听…");
+    await useTab(false);
+    const status = await ensureHook();
+    let latest = await hook("latest", false);
+    if (!latest && form.mode === "current") {
+      setStatus("尚未捕获评论接口，正在重新提交当前查询（不刷新、不改筛选）…");
+      const found = await uiSearch(null).catch(error => { logEvent("warn", error.message); return null; });
+      latest = found ? found.record : await hook("latest", false);
+      if (!latest) {
+        const info = await hook("paginationInfo");
+        if (info.hasNext) {
+          const before = (await hook("status")).seq;
+          await hook("clickNext");
+          const f = await waitForRecord(before, () => true, 15000);
+          if (!f.timeout) latest = f.record;
         }
       }
+      if (!latest) throw new Error(`页面监听已就绪，但还没有捕获到评论接口响应${status.lateInstall ? "（监听是在页面打开后补注入的）" : ""}。请在评价页上点一次“查询”或翻一页后，再点“创建并开始任务”。`);
     }
-    return null;
+    const now = Date.now();
+    const task = {
+      id: crypto.randomUUID(), createdAt: now, updatedAt: now,
+      mode: form.mode,
+      name: form.mode === "current" ? "当前筛选" : ids.length === 1 ? `商品 ${ids[0]}` : `商品列表 ${ids.length} 个`,
+      config: { startPage: form.startPage, endPage: form.endPage, pageSize: form.pageSize, batchSize: form.batchSize, delayMs: form.delayMs, driver: form.driver },
+      template: null, pagination: null, productPath: null, stripSign: false, driverUsed: "",
+      items: ids.map(id => ({ targetId: id, status: "pending", nextPage: form.startPage, cursor: "", total: null, totalPages: 0, rows: 0, pages: 0, error: "" })),
+      index: 0, status: "paused", rowCount: 0, imageCount: 0, lastError: ""
+    };
+    if (latest) {
+      setupTemplate(task, templateOf(latest));
+      if (form.mode === "ids") task.productPath = await learnedProductPath(task.template);
+      const d = C.describeTemplate(task.template);
+      logEvent("info", `模板：${d.method} ${d.endpoint}，分页=${d.pagination.kind}${d.pagination.pageKey ? `(${d.pagination.pageKey})` : ""}，每页参数=${d.pagination.sizeKey || "无"}，商品参数=${task.productPath ? task.productPath.join(".") : "未学习"}`);
+    }
+    await store.putTask(task);
+    selectedId = task.id;
+    await refreshTaskList();
+    await runTask(task);
   }
 
-  // Only transfer and parse requests captured after a given timestamp.
-  // Avoids re-serializing all historical requests (~20+ by page 20) on every poll tick.
-  async function getCapturedPayloadsAfter(afterTime) {
-    const [result] = await executeScript({
-      target: { tabId: activeTabId },
-      world: "MAIN",
-      args: [afterTime],
-      func: (afterTime) => {
-        const cap = window.__TK_REVIEW_CAPTURE__ || { requests: [] };
-        return (cap.requests || []).filter(r => r.capturedAt > afterTime);
-      }
+  // ---------------- 导出 ----------------
+  function download(blob, filename) {
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url; a.download = filename;
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 30000);
+  }
+  function safeName(text) { return String(text).replace(/[\\/:*?"<>|\s]+/g, "_").slice(0, 60); }
+  function stamp(ts) { const d = new Date(ts); const p = n => String(n).padStart(2, "0"); return `${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}-${p(d.getHours())}${p(d.getMinutes())}`; }
+  function textSheet(aoa, widths) {
+    const XLSX = window.XLSX;
+    const sheet = XLSX.utils.aoa_to_sheet(aoa);
+    if (widths) sheet["!cols"] = widths.map(w => ({ wch: w }));
+    return sheet;
+  }
+  async function exportXlsx(task) {
+    const XLSX = window.XLSX;
+    if (!XLSX) throw new Error("Excel 组件未加载。");
+    setStatus("正在生成 Excel…");
+    const records = (await store.readRows(task.id)).sort((a, b) => a.order - b.order);
+    const book = XLSX.utils.book_new();
+    const widths = { target_id: 21, star_level: 6, review_text: 50, reply_text: 30, reply_count: 6, main_review_id: 21, order_id: 21, product_id: 21, product_name: 30, sku_id: 21, sku_specification: 20, user_name: 14, create_time: 19, review_image_count: 8, review_image_urls: 60, page: 6 };
+    XLSX.utils.book_append_sheet(book, textSheet(C.exportAoa(records), C.OUTPUT_COLUMNS.map(([k]) => widths[k] || 12)), "评论");
+    const images = [["采集商品 ID", "评论 ID", "商品 ID", "图片序号", "图片链接", "缩略图链接"]];
+    for (const r of records) (r.row.review_images || []).forEach((img, i) => images.push([r.targetId || "", r.row.main_review_id, r.row.product_id, i + 1, img.url, img.thumbnail || ""]));
+    XLSX.utils.book_append_sheet(book, textSheet(images, [21, 21, 21, 8, 80, 80]), "评价图");
+    if (task.mode === "ids") {
+      const summary = [["采集商品 ID", "状态", "接口总条数", "已采集条数", "已采集页数", "说明"]];
+      const names = { done: "完成", empty: "无评论", error: "失败", pending: "未开始", running: "未完成" };
+      for (const item of task.items) summary.push([item.targetId, names[item.status] || item.status, item.total == null ? "" : item.total, item.rows || 0, item.pages || 0, item.error || ""]);
+      XLSX.utils.book_append_sheet(book, textSheet(summary, [21, 8, 10, 10, 10, 60]), "商品汇总");
+    }
+    const info = [["项目", "值"], ["任务", task.name], ["创建时间", new Date(task.createdAt).toLocaleString()], ["状态", task.status], ["评论条数", records.length], ["评价图数量", images.length - 1], ["页码范围", `${task.config.startPage} - ${task.config.endPage || "全部"}`], ["翻页方式", task.driverUsed === "api" ? "接口直连" : "页面点击"], ["接口", task.template ? endpointOf(task.template.url) : ""], ["错误", task.lastError || ""]];
+    XLSX.utils.book_append_sheet(book, textSheet(info, [12, 60]), "任务信息");
+    const out = XLSX.write(book, { bookType: "xlsx", type: "array", compression: true });
+    download(new Blob([out], { type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" }), `TK评论_${safeName(task.name)}_${stamp(task.createdAt)}.xlsx`);
+    setStatus(`已导出 ${records.length} 条评论、${images.length - 1} 张评价图链接。`);
+  }
+  async function downloadImages(task) {
+    if (!chrome.downloads) throw new Error("浏览器未授予下载权限，请在扩展管理中重新加载扩展。");
+    const records = (await store.readRows(task.id)).sort((a, b) => a.order - b.order);
+    const ascii = text => String(text).replace(/[^A-Za-z0-9._-]+/g, "_").slice(0, 60) || "x";
+    const folder = `${task.mode === "current" ? "filtered" : task.items.length === 1 ? ascii(task.items[0].targetId) : `list-${task.items.length}`}_${stamp(task.createdAt)}`;
+    const jobs = [];
+    for (const r of records) (r.row.review_images || []).forEach((img, i) => {
+      const ext = (img.url.split("?")[0].match(/\.(jpe?g|png|webp|gif|heic|avif)$/i) || [, "jpg"])[1].toLowerCase();
+      // 下载目录只用 ASCII：部分系统上 chrome.downloads 会拒绝含中文的路径
+      jobs.push({ url: img.url, filename: `TK_review_images/${folder}/${ascii(r.targetId || r.row.product_id || "unknown")}/${ascii(r.row.main_review_id || r.key)}_${i + 1}.${ext}` });
     });
-    const newRequests = result && result.result ? result.result : [];
-    return newRequests
-      .filter(r => !r.status || (r.status >= 200 && r.status < 300))
-      .map(r => ({ request: r, payload: findReviewPayload(r.responseJson || parseJson(r.responseText)) }))
-      .filter(item => item.payload && payloadMatchesProduct(item.payload, item.request))
-      .map(item => item.payload)
-      .filter(payload => payload && payload.list && payload.list.length);
-  }
-
-  async function getCapturedPayloads() {
-    const [result] = await executeScript({
-      target: { tabId: activeTabId },
-      world: "MAIN",
-      func: () => window.__TK_REVIEW_CAPTURE__ || { requests: [] }
-    });
-    const capture = result && result.result ? result.result : { requests: [] };
-    return (capture.requests || [])
-      .map(request => findReviewPayload(request.responseJson || parseJson(request.responseText)))
-      .filter(payload => payload && payload.list && payload.list.length);
-  }
-
-  async function clickNextPage() {
-    const [result] = await executeScript({
-      target: { tabId: activeTabId },
-      world: "MAIN",
-      func: () => {
-        const candidates = Array.from(document.querySelectorAll(".core-pagination-item-next, li[aria-label='Next'], [aria-label='Next']"));
-        const next = candidates.find(el => {
-          const className = el.className ? String(el.className) : "";
-          const rect = el.getBoundingClientRect();
-          const visible = rect.width > 0 && rect.height > 0;
-          return visible && !/disabled/i.test(className) && el.getAttribute("aria-disabled") !== "true";
-        });
-        if (!next) return false;
-        const active = document.querySelector(".core-pagination-item-active, [aria-current='page']");
-        window.__TK_REVIEW_EXPECT_PAGE__ = { page: active ? (parseInt(active.textContent, 10) || 0) + 1 : 0 };
-        next.scrollIntoView({ block: "center", inline: "center" });
-        next.dispatchEvent(new MouseEvent("mousedown", { bubbles: true, cancelable: true, view: window }));
-        next.dispatchEvent(new MouseEvent("mouseup", { bubbles: true, cancelable: true, view: window }));
-        next.click();
-        return true;
-      }
-    });
-    return !!(result && result.result);
-  }
-
-  async function replayRequest(request, cursor) {
-    const [result] = await executeScript({
-      target: { tabId: activeTabId },
-      world: "MAIN",
-      args: [request, cursor],
-      func: async (request, cursor) => {
-        function replaceCursorInUrl(rawUrl) {
-          const url = new URL(rawUrl, location.href);
-          const keys = ["cursor", "next_cursor", "page_token", "offset"];
-          let changed = false;
-          for (const key of keys) {
-            if (url.searchParams.has(key)) {
-              url.searchParams.set(key, cursor);
-              changed = true;
-            }
-          }
-          // Preserve signed URLs; do not invent pagination parameters.
-          return url.toString();
+    if (!jobs.length) throw new Error("该任务没有评价图。");
+    busy = true; pauseRequested = false; controls();
+    let done = 0, failed = 0;
+    try {
+      const worker = async () => {
+        while (jobs.length && !pauseRequested) {
+          const job = jobs.shift();
+          try { await chrome.downloads.download({ url: job.url, filename: job.filename, conflictAction: "uniquify", saveAs: false }); done++; }
+          catch (error) { failed++; logEvent("warn", `图片下载失败：${error.message}（${job.filename}）`); }
+          setStatus(`正在下载评价图：${done} 成功 / ${failed} 失败，剩余 ${jobs.length}…`);
         }
-
-        function replaceCursorInObject(value) {
-          if (!value || typeof value !== "object") return value;
-          if (Array.isArray(value)) {
-            for (const item of value) replaceCursorInObject(item);
-            return value;
-          }
-          for (const key of Object.keys(value)) {
-            if (/^(cursor|next_cursor|page_token|offset)$/i.test(key)) {
-              value[key] = cursor;
-            } else if (typeof value[key] === "string") {
-              value[key] = replaceCursorInString(value[key]);
-            } else {
-              replaceCursorInObject(value[key]);
-            }
-          }
-          return value;
-        }
-
-        function replaceCursorInString(text) {
-          try {
-            const parsed = JSON.parse(text);
-            return JSON.stringify(replaceCursorInObject(parsed));
-          } catch (error) {}
-          if (/[?&](cursor|next_cursor|page_token|offset)=/i.test(text)) {
-            return text.replace(/([?&](?:cursor|next_cursor|page_token|offset)=)[^&]*/ig, `$1${encodeURIComponent(cursor)}`);
-          }
-          return text;
-        }
-
-        let body = request.requestBody || undefined;
-        if (body) body = replaceCursorInString(body);
-        const response = await fetch(replaceCursorInUrl(request.url), {
-          method: request.method || "GET",
-          credentials: "include",
-          headers: request.requestHeaders || {},
-          body: /^(GET|HEAD)$/i.test(request.method || "GET") ? undefined : body
-        });
-        const text = await response.text();
-        if (!response.ok) throw new Error(`翻页接口 HTTP ${response.status}`);
-        return JSON.parse(text);
-      }
-    });
-    if (!result) throw new Error("未获得翻页请求结果。");
-    if (result.error) throw new Error(result.error.message || String(result.error));
-    return result.result;
+      };
+      await Promise.all([worker(), worker(), worker()]);
+      setStatus(`评价图下载已提交：${done} 张${failed ? `，${failed} 张失败（链接可能已过期，可重新采集后再下载）` : ""}。文件在浏览器下载目录的 TK_review_images/${folder} 文件夹，按商品 ID 分目录、以“评论ID_序号”命名。`);
+    } finally { busy = false; pauseRequested = false; controls(); }
   }
 
+  // ---------------- 界面 ----------------
   function renderPreview() {
     els.previewBody.textContent = "";
-    for (const row of previewRows.slice(0, 100)) {
+    for (const record of preview.slice().reverse()) {
       const tr = document.createElement("tr");
-      for (const key of outputColumns) {
+      for (const [key] of PREVIEW_COLUMNS) {
         const td = document.createElement("td");
-        td.textContent = row[key] === undefined || row[key] === null ? "" : String(row[key]);
+        const value = key === "target_id" ? record.targetId : key === "page" ? record.page : record.row[key];
+        td.textContent = value == null ? "" : String(value);
         td.title = td.textContent;
         tr.appendChild(td);
       }
       els.previewBody.appendChild(tr);
     }
-    updateResultMeta();
+    els.rowCount.textContent = `预览（最近 ${preview.length} 条）`;
   }
-
-  function updateResultMeta() {
-    els.rowCount.textContent = `${rows.length} 条`;
-    els.downloadCsv.disabled = rows.length === 0;
+  function controls() {
+    const task = selectedTask;
+    els.createTask.disabled = busy;
+    els.pauseTask.disabled = !busy;
+    els.resumeTask.disabled = busy || !task || task.status === "done";
+    els.exportXlsx.disabled = busy && !running ? true : !task;
+    els.downloadImages.disabled = busy || !task || !task.imageCount;
+    els.deleteTask.disabled = busy || !task;
+    els.taskSelect.disabled = busy;
+    for (const el of document.querySelectorAll("input[name=mode], #productIds, #idFile, #startPage, #endPage, #pageSize, #batchSize, #delayMs, #driver")) el.disabled = busy;
   }
-
-  function htmlEscape(value) {
-    const text = value === undefined || value === null ? "" : String(value);
-    return text
-      .replace(/&/g, "&amp;")
-      .replace(/</g, "&lt;")
-      .replace(/>/g, "&gt;")
-      .replace(/"/g, "&quot;");
+  let selectedTask = null;
+  const STATUS = { running: "运行中", paused: "已暂停", done: "已完成", error: "出错暂停" };
+  async function refreshTaskList() {
+    const tasks = await store.listTasks();
+    els.taskSelect.textContent = "";
+    const none = document.createElement("option");
+    none.value = ""; none.textContent = tasks.length ? "选择已保存任务" : "暂无任务";
+    els.taskSelect.appendChild(none);
+    for (const task of tasks) {
+      const option = document.createElement("option");
+      option.value = task.id;
+      option.textContent = `${new Date(task.createdAt).toLocaleString()} · ${task.name} · ${STATUS[task.status] || task.status} · ${task.rowCount || 0} 条`;
+      els.taskSelect.appendChild(option);
+    }
+    selectedTask = selectedId ? tasks.find(t => t.id === selectedId) || null : null;
+    if (running && selectedTask && running.id === selectedTask.id) selectedTask = running;
+    els.taskSelect.value = selectedTask ? selectedTask.id : "";
+    if (selectedTask) {
+      const t = selectedTask;
+      const failed = t.items.filter(i => i.status === "error").length;
+      const done = t.items.filter(i => i.status === "done" || i.status === "empty").length;
+      els.taskInfo.textContent = `${t.name}｜${STATUS[t.status] || t.status}｜${t.rowCount || 0} 条评论｜${t.imageCount || 0} 张图${t.items.length > 1 ? `｜商品 ${done}/${t.items.length} 完成${failed ? `，${failed} 失败` : ""}` : `｜已到第 ${t.items[0].nextPage - 1} 页${t.items[0].totalPages ? ` / ${t.items[0].totalPages}` : ""}`}${t.lastError ? `｜${t.lastError}` : ""}`;
+      summarize(t);
+    } else els.taskInfo.textContent = "";
+    controls();
   }
-
-  function downloadExcel() {
-    const header = outputColumns
-      .map(column => `<th>${htmlEscape(outputColumnLabels[column] || column)}</th>`)
-      .join("");
-    const body = rows
-      .map(row => `<tr>${outputColumns.map(column => `<td>${htmlEscape(row[column])}</td>`).join("")}</tr>`)
-      .join("");
-    const workbook = `<!DOCTYPE html>
-<html>
-<head>
-<meta charset="UTF-8">
-<style>
-table { border-collapse: collapse; }
-th, td { border: 1px solid #d9d9d9; padding: 4px 6px; mso-number-format:"\\@"; }
-th { background: #e9fbfd; }
-</style>
-</head>
-<body>
-<table>
-<thead><tr>${header}</tr></thead>
-<tbody>${body}</tbody>
-</table>
-</body>
-</html>`;
-    const blob = new Blob([`\uFEFF${workbook}`], { type: "application/vnd.ms-excel;charset=utf-8" });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = `tk-shop-reviews-${new Date().toISOString().slice(0, 10)}.xls`;
-    document.body.appendChild(a);
-    a.click();
-    a.remove();
-    URL.revokeObjectURL(url);
-  }
-
-  function setFetching(active) {
-    isFetching = active;
-    stopRequested = false;
-    els.clearData.textContent = active ? "停止" : "清空";
-    els.clearData.disabled = false;
-    els.fetchReviews.disabled = active;
-    els.startCapture.disabled = active;
-    els.readCapture.disabled = active;
-    els.refreshStats.disabled = active;
-    els.pageStart.disabled = active;
-    els.pageEnd.disabled = active;
-    els.productSearchId.disabled = active;
-  }
-
-  function clearData() {
-    rows = [];
-    previewRows = [];
-    capturedRequest = null;
-    capturedPayload = null;
-    els.nextCursor.textContent = "";
-    setProgress(0, 100);
+  async function showTask(id) {
+    selectedId = id;
+    await refreshTaskList();
+    preview = selectedTask ? (await store.readRows(selectedTask.id)).sort((a, b) => a.order - b.order).slice(-50) : [];
     renderPreview();
-    setStatus("已清空。");
   }
 
-  async function run(action, asFetch) {
-    if (actionBusy) return;
-    actionBusy = true;
-    if (window.dispatchEvent) window.dispatchEvent(new Event("tk-review-busy"));
-    if (asFetch) setFetching(true);
-    else for (const el of [els.startCapture, els.readCapture, els.refreshStats, els.fetchReviews, els.clearData]) el.disabled = true;
-    els.productSearchId.disabled = true;
-    try {
-      await action();
-    } catch (error) {
-      const message = errorText(error);
-      setStatus(`错误：${message}`);
-      console.error("[TK评论抓取]", error);
-    } finally {
-      if (asFetch) setFetching(false);
-      else for (const el of [els.startCapture, els.readCapture, els.refreshStats, els.fetchReviews, els.clearData]) el.disabled = false;
-      lockedTabId = 0;
-      lockedProductId = "";
-      els.productSearchId.disabled = false;
-      actionBusy = false;
-      if (window.dispatchEvent) window.dispatchEvent(new Event("tk-review-busy"));
-    }
+  // 表单持久化（ID 列表不会因刷新 / 重开侧栏丢失）
+  async function saveForm() {
+    try { await chrome.storage.local.set({ [FORM_KEY]: readForm() }); } catch (_) {}
+  }
+  async function loadForm() {
+    const form = (await chrome.storage.local.get(FORM_KEY))[FORM_KEY];
+    if (!form) return;
+    const radio = document.querySelector(`input[name=mode][value="${form.mode}"]`);
+    if (radio) radio.checked = true;
+    els.productIds.value = form.ids || "";
+    els.startPage.value = form.startPage || 1;
+    els.endPage.value = form.endPage || "";
+    els.pageSize.value = form.pageSize || 50;
+    els.batchSize.value = form.batchSize || 50;
+    els.delayMs.value = form.delayMs ?? 600;
+    els.driver.value = form.driver || "auto";
+  }
+  function updateIdsUi() {
+    const mode = document.querySelector("input[name=mode]:checked").value;
+    els.idsBox.hidden = mode !== "ids";
+    try { els.idCount.textContent = `${window.TKProductImport.text(els.productIds.value).length} 个 ID`; }
+    catch (error) { els.idCount.textContent = els.productIds.value.trim() ? error.message : "0 个 ID"; }
   }
 
-  function responseShape(value, depth = 0) {
-    if (depth > 6) return "…";
-    if (Array.isArray(value)) return { length: value.length, item: responseShape(value[0], depth + 1) };
-    if (!value || typeof value !== "object") return typeof value;
-    return Object.fromEntries(Object.keys(value).slice(0, 35).map(key => [key, responseShape(value[key], depth + 1)]));
-  }
-
-  function diagnosticReport() {
-    const report = {
-      generatedAt: new Date().toISOString(), version: chrome.runtime.getManifest().version,
-      userAgent: navigator.userAgent, status: els.status.textContent.replace(/https?:\/\/[^\s｜；]+/g, safeUrl),
-      activeTabId, busy: actionBusy, pageInfo, rows: rows.length, productFilter: filterProbe,
-      task: taskDiagnostic,
-      probe: probeResults, events: diagnosticEvents.slice()
+  function action(fn) {
+    return async () => {
+      if (busy) { setStatus("正在执行其他操作，请稍候或先暂停。"); return; }
+      clearError();
+      try { await fn(); } catch (error) { showError(error); busy = false; controls(); }
     };
-    // Also sanitize browser-provided errors, which may contain a full page URL.
-    return JSON.parse(JSON.stringify(report, (_, value) => typeof value === "string" ? value.replace(/https?:\/\/[^\s｜；]+/g, safeUrl) : value));
   }
 
-  async function runProbes() {
-    if (actionBusy) throw new Error("抓取正在运行，请停止后运行探针。");
-    actionBusy = true;
-    probeResults = { api: {}, checks: [] };
+  els.createTask.addEventListener("click", action(async () => { await saveForm(); await createTask(); }));
+  els.pauseTask.addEventListener("click", () => { pauseRequested = true; setStatus("正在暂停，当前页保存后停止…"); });
+  els.resumeTask.addEventListener("click", action(async () => {
+    const task = await store.getTask(selectedId);
+    if (!task) throw new Error("请选择要继续的任务。");
+    for (const item of task.items) if (item.status === "error") { item.status = "pending"; item.error = ""; }
+    if (task.status === "done" && task.items.every(i => i.status === "done" || i.status === "empty")) throw new Error("任务已完成。");
+    task.index = task.items.findIndex(i => i.status !== "done" && i.status !== "empty");
+    await runTask(task);
+  }));
+  els.taskSelect.addEventListener("change", action(() => showTask(els.taskSelect.value)));
+  els.exportXlsx.addEventListener("click", async () => {
+    clearError();
+    try { const task = running && running.id === selectedId ? running : await store.getTask(selectedId); if (!task) throw new Error("请先选择任务。"); await exportXlsx(task); }
+    catch (error) { showError(error); }
+  });
+  els.downloadImages.addEventListener("click", action(async () => { const task = await store.getTask(selectedId); if (!task) throw new Error("请先选择任务。"); await downloadImages(task); }));
+  els.deleteTask.addEventListener("click", action(async () => {
+    if (!selectedId || !confirm("删除该任务及其已采集数据？")) return;
+    await store.deleteTask(selectedId); selectedId = ""; preview = []; renderPreview(); await refreshTaskList(); setStatus("任务已删除。");
+  }));
+  for (const radio of document.querySelectorAll("input[name=mode]")) radio.addEventListener("change", () => { updateIdsUi(); saveForm(); });
+  for (const el of [els.productIds, els.startPage, els.endPage, els.pageSize, els.batchSize, els.delayMs, els.driver]) el.addEventListener("change", saveForm);
+  els.productIds.addEventListener("input", () => { updateIdsUi(); saveForm(); });
+  els.idFile.addEventListener("change", action(async () => {
+    const file = els.idFile.files[0];
+    if (!file) return;
     try {
-      for (const [namespace, methods] of Object.entries({ tabs: ["query", "get", "reload"], scripting: ["executeScript", "registerContentScripts", "getRegisteredContentScripts"] })) {
-        for (const method of methods) probeResults.api[`${namespace}.${method}`] = typeof (chrome[namespace] || {})[method] === "function";
-      }
-      const tabs = await queryTabs({ currentWindow: true });
-      probeResults.tabs = tabs.map(tab => ({ id: tab.id, active: !!tab.active, url: safeUrl(tabUrl(tab)), ratingPage: isTikTokRatingUrl(tabUrl(tab)) }));
-      const tab = await getActiveTab();
-      activeTabId = tab.id;
-      for (const world of ["ISOLATED", "MAIN"]) {
-        try {
-          const [fileResult] = await executeScript({ target: { tabId: tab.id }, world, files: ["tiktok_probe.js"] });
-          probeResults.checks.push({ world, method: "files", result: fileResult.result });
-        } catch (error) { probeResults.checks.push({ world, method: "files", error: errorText(error) }); }
-        try {
-          const [funcResult] = await executeScript({ target: { tabId: tab.id }, world, func: () => ({ readyState: document.readyState, isolated: !!(typeof chrome !== "undefined" && chrome.runtime && chrome.runtime.id) }) });
-          probeResults.checks.push({ world, method: "func", result: funcResult.result });
-        } catch (error) { probeResults.checks.push({ world, method: "func", error: errorText(error) }); }
-        try {
-          const [promiseResult] = await executeScript({ target: { tabId: tab.id }, world, func: () => Promise.resolve({ promiseAwaited: true }) });
-          probeResults.checks.push({ world, method: "func-promise", result: { promiseAwaited: !!(promiseResult.result && promiseResult.result.promiseAwaited) } });
-        } catch (error) { probeResults.checks.push({ world, method: "func-promise", error: errorText(error) }); }
-      }
-      try {
-        const snapshot = await getCaptureSnapshot();
-        probeResults.capture = {
-          installedAt: snapshot.installedAt, network: snapshot.network || [],
-          requests: (snapshot.requests || []).map(request => ({
-            url: safeUrl(request.url), method: request.method, status: request.status,
-            capturedAt: request.capturedAt, headerNames: Object.keys(request.requestHeaders || {}),
-            navigationPage: request.navigationPage, sequence: request.sequence,
-            parsedReviews: (findReviewPayload(request.responseJson) || { list: [] }).list.length,
-            shape: responseShape(request.responseJson)
-          }))
+      const result = await window.TKProductImport.file(file);
+      els.productIds.value = result.ids.join("\n");
+      document.querySelector("input[name=mode][value=ids]").checked = true;
+      updateIdsUi(); await saveForm();
+      setStatus(`已从“${result.sheet}”导入 ${result.ids.length} 个 ID。`);
+    } finally { els.idFile.value = ""; }
+  }));
+  window.addEventListener("error", event => logEvent("uncaught", event.message, event.error && event.error.stack));
+  window.addEventListener("unhandledrejection", event => logEvent("unhandled", event.reason && event.reason.message || String(event.reason), event.reason && event.reason.stack));
+
+  // ---------------- 诊断接口（诊断 TAB 调用） ----------------
+  async function diagnosticReport() {
+    const report = { generatedAt: new Date().toISOString(), version: VERSION, userAgent: navigator.userAgent, tabId, busy, status: els.status.textContent, events: events.slice(-120) };
+    if (selectedTask) {
+      const t = selectedTask;
+      report.task = { id: t.id, name: t.name, mode: t.mode, status: t.status, config: t.config, driverUsed: t.driverUsed, stripSign: t.stripSign, productPath: t.productPath, lastError: t.lastError, rowCount: t.rowCount, imageCount: t.imageCount, items: t.items.slice(0, 20).map(i => ({ targetId: i.targetId, status: i.status, nextPage: i.nextPage, total: i.total, totalPages: i.totalPages, rows: i.rows, error: i.error })), template: t.template ? C.describeTemplate(t.template) : null };
+    }
+    return JSON.parse(JSON.stringify(report, (_, v) => typeof v === "string" ? sanitize(v) : v));
+  }
+  async function probe() {
+    const out = { at: new Date().toISOString(), checks: {} };
+    try {
+      const tab = await useTab(false);
+      out.tab = { id: tab.id, url: sanitize(tab.url), status: tab.status };
+    } catch (error) { out.tabError = error.message; return out; }
+    try { out.checks.isolated = await exec(() => ({ readyState: document.readyState, extension: !!(chrome && chrome.runtime && chrome.runtime.id) }), [], "ISOLATED"); } catch (error) { out.checks.isolatedError = error.message; }
+    try { out.checks.main = await exec(() => ({ readyState: document.readyState, hook: !!window.__TKR__, oldHook: !!window.__TK_REVIEW_CAPTURE_HOOKED__ })); } catch (error) { out.checks.mainError = error.message; }
+    try { out.hook = await ensureHook(); } catch (error) { out.hookError = error.message; }
+    try {
+      const latest = await hook("latest", false);
+      if (latest) {
+        const { json, payload } = parseRecord(latest);
+        out.latestResponse = {
+          status: latest.status, transport: latest.transport, activePage: latest.activePage,
+          template: C.describeTemplate(templateOf(latest), { activePage: latest.activePage }),
+          reviews: payload ? payload.list.length : 0, total: payload ? payload.total : null, hasMore: payload ? payload.hasMore : null,
+          responseShape: C.shape(json),
+          firstReviewShape: payload && payload.list[0] ? C.shape(payload.list[0]) : null,
+          imageFieldsFound: payload && payload.list.length ? [...new Set(payload.list.flatMap(item => C.extractImages(item).sources))] : []
         };
-      } catch (error) { probeResults.captureError = errorText(error); }
-      try { probeResults.registeredScripts = await chromeCall("scripting", "getRegisteredContentScripts", { ids: [captureScriptId] }); }
-      catch (error) { probeResults.registrationError = errorText(error); }
-      logDiagnostic("probe", "探针完成；files / func / world 的结果已记录。");
-      return diagnosticReport();
-    } catch (error) {
-      logDiagnostic("probe-error", errorText(error));
-      throw error;
-    } finally { actionBusy = false; lockedTabId = 0; }
+        const learned = await learnedProductPath(templateOf(latest));
+        out.learnedProductPath = learned ? learned.join(".") : null;
+      } else out.latestResponse = null;
+    } catch (error) { out.latestError = error.message; }
+    logEvent("info", "诊断探针已运行。");
+    return out;
   }
-
-  async function taskPageState() {
-    const [injection] = await executeScript({ target: { tabId: activeTabId }, world: "ISOLATED", func: () => {
-      const active = document.querySelector(".core-pagination-item-active, .core-pagination-item[aria-current='page']");
-      const texts = Array.from(document.querySelectorAll(".core-select-view-value, [class*='select-view-value'], [aria-label='Page size']")).map(el => (el.textContent || "").trim());
-      const sizeText = texts.find(text => /\d+\s*(?:\/\s*(?:page|页)|条\s*\/\s*页|条\s*每页)/i.test(text)) || "";
-      const match = sizeText.match(/\d+/);
-      const domFilters = Array.from(document.querySelectorAll("input, select, .core-select-view-value, .core-radio-checked, .core-checkbox-checked, [role='radio'][aria-checked='true']"))
-        .filter(el => { const rect = el.getBoundingClientRect(); return rect.width > 0 && rect.height > 0 && !el.closest("[class*='pagination'], [class*='input-search'], [class*='search-input'], [role='search']") && !/hidden|password/.test(el.type || ""); })
-        .filter(el => !texts.includes((el.textContent || "").trim()) || !/\d+\s*(?:\/\s*(?:page|页)|条\s*\/\s*页|条\s*每页)/i.test((el.textContent || "").trim()))
-        .filter(el => (el.tagName !== "INPUT" || (el.value && !/^\d{12,}$/.test(el.value) && (!/checkbox|radio/.test(el.type) || el.checked))))
-        .map(el => ({ name: el.name || el.getAttribute("aria-label") || el.getAttribute("placeholder") || "", value: el.value || (el.textContent || "").trim() }));
-      const searchFilters = Array.from(document.querySelectorAll("input"))
-        .filter(el => { const rect = el.getBoundingClientRect(); return rect.width > 0 && rect.height > 0 && !el.closest("[class*='pagination']") && !/hidden|password|checkbox|radio/.test(el.type || ""); })
-        .map(el => ({ name: el.id || el.name || el.getAttribute("placeholder") || "", value: el.value }));
-      return { href: location.href, page: active ? parseInt(active.textContent, 10) || 0 : 0, pageSize: match ? Number(match[0]) : 0, domFilters, searchFilters };
-    } });
-    return injection.result;
-  }
-
-  function taskSignature(payload) { return JSON.stringify(payload.list.map(item => String(flattenReview(item).main_review_id))); }
-  function taskRows(payload, path) {
-    const stats = { paths: new Set(), unknown: new Set() };
-    const result = payload.list.map(item => {
-      const row = flattenReview(item);
-      if (typeof row.product_id === "number" && !Number.isSafeInteger(row.product_id)) throw window.TKReviewTasks.controlError("接口商品 ID 为不精确数字，无法保证导出编号准确；请运行诊断。");
-      const media = window.TKReviewTasks.extractImages(item, path);
-      media.paths.forEach(key => stats.paths.add(key)); media.unknown.forEach(key => stats.unknown.add(key));
-      return { ...row, review_images: media.images, review_image_count: media.images.length, review_image_urls: media.images.map(image => image.url).join("\n") };
-    });
-    return { rows: result, mediaStats: { paths: [...stats.paths], unknown: [...stats.unknown] } };
-  }
-
-  async function taskData(request, payload, imagePath = "") {
-    if (payload.list.length) requireProductPayload(payload);
-    const state = await taskPageState();
-    const context = window.TKReviewTasks.requestContext(request, state.href);
-    context.domFilters = state.domFilters;
-    if (window.TKReviewTaskMode === "current") context.searchFilters = state.searchFilters;
-    const requestSize = requestPageSize(request, state.href);
-    if (state.pageSize && requestSize && state.pageSize !== requestSize) throw window.TKReviewTasks.controlError("页面与接口每页条数不一致，已暂停；请运行诊断。");
-    const pageSize = state.pageSize || requestSize;
-    return { ...taskRows(payload, imagePath), request, payload, context, page: state.page || (payload.total === 0 ? 1 : 0), pageSize, signature: taskSignature(payload), total: payload.total };
-  }
-
-  function requestPageSize(request, href = "https://request.invalid") {
-    const values = [];
-    function visit(value, depth = 0) {
-      if (!value || typeof value !== "object" || depth > 5) return;
-      for (const [key, item] of Object.entries(value)) {
-        if (/^(pagesize|perpage|limit)$/i.test(key.replace(/[_-]/g, ""))) {
-          const size = Number(item); if (Number.isSafeInteger(size) && size > 0 && size <= 500) values.push(size);
-        } else if (item && typeof item === "object") visit(item, depth + 1);
-        else if (typeof item === "string" && /^[\[{]/.test(item.trim())) { try { visit(JSON.parse(item), depth + 1); } catch (_) {} }
-      }
-    }
-    try { visit(Object.fromEntries(new URL(request.url, href).searchParams)); } catch (_) {}
-    try { visit(JSON.parse(request.requestBody || "null")); } catch (_) { visit(Object.fromEntries(new URLSearchParams(request.requestBody || ""))); }
-    return new Set(values).size === 1 ? values[0] : 0;
-  }
-
-  async function prepareLiveTask(task, mode = "current", productId = "") {
-    window.TKReviewTaskMode = mode;
-    stopRequested = false;
-    if (!(await refreshActiveTabStatus())) throw new Error("请打开商品评价页面。");
-    lockedTabId = activeTabId;
-    lockedProductId = mode === "current" ? "" : productId;
-    if (lockedProductId && !/^\d+$/.test(lockedProductId)) throw new Error("商品 ID 必须为完整数字编号。");
-    window.TKReviewTaskImagePath = task ? task.config.imagePath || "" : window.TKReviewTaskImagePath || "";
-    const before = await taskPageState();
-    if (task && (!window.TKReviewTasks.sameContext(before.domFilters, task.context.domFilters) || (mode === "current" && !window.TKReviewTasks.sameContext(before.searchFilters, task.context.searchFilters)))) {
-      throw window.TKReviewTasks.controlError("当前筛选条件与保存的任务不一致，请恢复原日期、评分和搜索条件后继续。");
-    }
-    if (taskPageCache && task && window.TKReviewTasks.sameContext(taskPageCache.context, task.context) && before.page === taskPageCache.page) {
-      taskPageCache = { ...taskPageCache, ...taskRows(taskPageCache.payload, window.TKReviewTaskImagePath) }; return taskPageCache;
-    }
-    // Attach to the loaded document. Reloading would discard the seller's filters.
-    await ensureCaptureScript();
-    await executeScript({ target: { tabId: activeTabId }, world: "MAIN", files: ["tiktok_capture_hook.js"] });
-    await verifyCaptureHook();
-    await loadProductFilter();
-    productInputDescriptor = null;
-    setStatus("正在识别当前页面的商品搜索框，不刷新页面…");
-    const inspected = await productFilterCommand("inspect", lockedProductId);
-    filterProbe = { ...filterProbe, fixed: !!lockedProductId, mode, inputFound: !!inspected.found, descriptor: inspected.descriptor };
-    if (!inspected.found) throw new Error("未找到唯一商品查询入口；请运行诊断，任务未改变筛选条件。");
-    productInputDescriptor = inspected.descriptor;
-    const started = Date.now();
-    const [baseline] = await executeScript({ target: { tabId: activeTabId }, world: "MAIN", func: () => {
-      window.__TK_REVIEW_CAPTURE__.requests = []; window.__TK_REVIEW_EXPECT_PAGE__ = { page: 1 };
-      return { sequence: window.__TK_REVIEW_CAPTURE__.sequence || 0 };
-    } });
-    const baselineSequence = baseline.result && baseline.result.sequence || 0;
-    setStatus(mode === "current" ? "正在提交原有筛选查询，保留当前搜索值和日期范围…" : "正在搜索指定商品并校验评论归属…");
-    const applied = await productFilterCommand(mode === "current" ? "submit-current" : "apply", lockedProductId);
-    if (!applied.ready) throw new Error("无法重新提交当前商品查询。");
-    setStatus("查询已提交，等待可确认的评论接口响应…");
-    for (let poll = 0; poll < 40; poll++) {
-      if (stopRequested) throw window.TKReviewTasks.controlError("已暂停任务。");
-      const state = await taskPageState();
-      if (!window.TKReviewTasks.sameContext(before.domFilters, state.domFilters) || (mode === "current" && !window.TKReviewTasks.sameContext(before.searchFilters, state.searchFilters))) throw window.TKReviewTasks.controlError("提交查询后筛选条件发生变化，已暂停，请恢复原条件。");
-      const snapshot = await getCaptureSnapshot();
-      const fault = (snapshot.network || []).find(item => item.at >= started && /review|rating/i.test(item.url) && [401, 403, 429].includes(item.status));
-      if (fault) throw window.TKReviewTasks.controlError(`评论接口 HTTP ${fault.status}；请处理登录、权限或限流后继续。`);
-      const fresh = (snapshot.requests || []).filter(item => item.capturedAt >= started && item.sequence > baselineSequence && item.navigationPage === 1);
-      const request = chooseReviewRequest(fresh);
-      if (!request && lockedProductId && fresh.some(item => item.status >= 200 && item.status < 300 && (findReviewPayload(item.responseJson) || { list: [] }).list.length)) {
-        throw window.TKReviewTasks.controlError("商品搜索未生效：返回评论不属于指定 ID，已停止；不会改抓全店评论。请运行诊断。");
-      }
-      if (request) {
-        const data = await taskData(request, findReviewPayload(request.responseJson || parseJson(request.responseText)), window.TKReviewTaskImagePath);
-        if (data.page !== 1) throw window.TKReviewTasks.controlError("无法确认查询返回第 1 页。");
-        if (!data.pageSize) throw window.TKReviewTasks.controlError("无法识别当前每页条数，请运行诊断；任务不会自动更改每页条数。");
-        if (!data.rows.length && data.total !== 0) throw new Error("空列表没有明确总数 0，不能确认商品无评论。");
-        pageInfo.pageSize = data.pageSize;
-        if (Number.isSafeInteger(data.total) && data.total >= 0) {
-          pageInfo.totalPages = Math.ceil(data.total / data.pageSize);
-          pageInfo.estimatedTotal = data.total;
+  async function testApi() {
+    const out = { at: new Date().toISOString() };
+    await useTab(false);
+    await ensureHook();
+    const latest = await hook("latest", false);
+    if (!latest) throw new Error("还没有捕获到评论接口响应。请在评价页点一次查询或翻页。");
+    const form = readForm();
+    for (const stripSign of [false, true]) {
+      const task = { config: { pageSize: form.pageSize }, stripSign };
+      setupTemplate(task, templateOf(latest));
+      out.template = C.describeTemplate(task.template, { activePage: latest.activePage });
+      const result = { stripSign };
+      try {
+        const item = { targetId: "", cursor: "" };
+        const p1 = await apiFetchPage(task, item, 1);
+        result.page1 = { reviews: p1.list.length, total: p1.total, nextCursor: !!p1.nextCursor };
+        item.cursor = p1.nextCursor;
+        if (task.pagination.kind) {
+          const p2 = await apiFetchPage(task, item, 2);
+          const s1 = C.payloadSignature(p1.list.map(C.flattenReview)), s2 = C.payloadSignature(p2.list.map(C.flattenReview));
+          result.page2 = { reviews: p2.list.length, differentFromPage1: s1 !== s2 };
         }
-        renderPageInfo(data.total);
-        els.estimatedTotal.textContent = String(data.total);
-        taskPageCache = data; return data;
-      }
-      await sleep(500);
+        result.ok = true;
+      } catch (error) { result.error = error.message; }
+      (out.attempts = out.attempts || []).push(result);
+      if (result.ok) break;
     }
-    throw new Error("重新提交查询后没有捕获到可确认的评论响应，请运行诊断。");
+    logEvent("info", `接口直连测试：${JSON.stringify(out.attempts)}`);
+    return out;
   }
+  window.TKReviewDiagnosticsAPI = { report: diagnosticReport, probe, testApi, clear: () => { events.length = 0; } };
 
-  async function prepareTask(task) {
-    const mode = task ? task.config.mode || "fixed" : "fixed";
-    let productId = task ? task.config.productId || "" : els.productSearchId.value.trim();
-    if (mode === "fixed" && !productId) {
-      await refreshActiveTabStatus(); await prepareProductFilter(); productId = lockedProductId;
-    }
-    if (mode !== "current" && !productId) throw window.TKReviewTasks.controlError("请填写固定商品 / SKU ID，或选择当前页面筛选结果。");
-    return prepareLiveTask(task, mode, productId);
-  }
-
-  async function taskReadPage(page, options = {}) {
-    if (stopRequested) throw window.TKReviewTasks.controlError("已暂停任务。");
-    let current = await taskPageState();
-    const live = ["fixed", "current", "list"].includes(window.TKReviewTaskMode);
-    if (live && taskPageCache && (!window.TKReviewTasks.sameContext(current.domFilters, taskPageCache.context.domFilters) || (window.TKReviewTaskMode === "current" && !window.TKReviewTasks.sameContext(current.searchFilters, taskPageCache.context.searchFilters)))) throw window.TKReviewTasks.controlError("采集中筛选条件发生变化，已暂停。");
-    if (page === 1 && current.page === 1 && taskPageCache) return taskPageCache;
-    let beforeTime = Date.now();
-    if (options.retry && !live) {
-      await refreshAndNavigateToPage(page, taskPageCache.request, []);
-      current = await taskPageState();
-    } else {
-      await executeScript({ target: { tabId: activeTabId }, world: "MAIN", func: () => { if (window.__TK_REVIEW_CAPTURE__) window.__TK_REVIEW_CAPTURE__.requests = []; } });
-      // Re-enter the requested page without reloading or clearing any filters.
-      if (current.page === page) {
-        const neighbor = page > 1 ? page - 1 : page + 1;
-        if (!await jumpToPageViaUI(neighbor)) throw new Error("无法重新进入断点页，请手动切到相邻页后继续。");
-        current = await taskPageState();
-      }
-      const moved = current.page === page - 1 ? await clickNextPage() : await jumpToPageViaUI(page);
-      if (!moved) throw new Error(`无法导航到第 ${page} 页。`);
-    }
-    for (let poll = 0; poll < 40; poll++) {
-      if (stopRequested) throw window.TKReviewTasks.controlError("已暂停任务。");
-      const snapshot = await getCaptureSnapshot();
-      const error = (snapshot.network || []).find(item => item.at >= beforeTime && /review|rating/i.test(item.url) && [401, 403, 429].includes(item.status));
-      if (error) throw window.TKReviewTasks.controlError(`评论接口 HTTP ${error.status}；请处理登录、权限或限流后继续。`);
-      const request = chooseReviewRequest((snapshot.requests || []).filter(item => item.capturedAt >= beforeTime && item.navigationPage === page));
-      if (request) {
-        const payload = findReviewPayload(request.responseJson || parseJson(request.responseText));
-        const data = await taskData(request, payload, window.TKReviewTaskImagePath || "");
-        if (data.page === page && data.rows.length && (!options.previous || data.signature !== options.previous.signature)) { taskPageCache = data; return data; }
-      }
-      await sleep(500);
-    }
-    throw new Error(`第 ${page} 页未获得可确认的评论响应；没有推进保存进度。`);
-  }
-
-  window.TKReviewTaskBridge = {
-    isBusy: () => actionBusy,
-    run: action => { if (actionBusy) throw new Error("评论面板正在执行其他操作，请稍后重试。"); return run(action, true); }, prepare: prepareTask, prepareLive: prepareLiveTask, read: taskReadPage,
-    pause: () => { stopRequested = true; }, status: setStatus,
-    settings: () => ({ productId: lockedProductId || els.productSearchId.value.trim(), startPage: parseOptionalPositiveInteger(els.pageStart) || 1, endPage: parseOptionalPositiveInteger(els.pageEnd) || 30 }),
-    applySettings: task => { els.productSearchId.value = task.config.productId; els.pageStart.value = task.config.startPage; els.pageEnd.value = task.config.endPage; window.TKReviewTaskImagePath = task.config.imagePath || ""; taskPageCache = null; },
-    show: (task, records) => {
-      taskDiagnostic = { status: task.status, lastPage: task.lastPage, uniqueCount: task.uniqueCount, imageCount: task.imageCount, scan: task.scan, lastError: task.lastError, mediaStats: task.mediaStats };
-      rows = records.map(record => record.row); previewRows = rows.slice(0, 100); renderPreview();
-      els.rowCount.textContent = `${task.uniqueCount} 条已保存，${task.imageCount} 张评价图（仅预览前 100 条）`;
-      els.downloadCsv.disabled = true;
-      setProgress(Math.max(0, task.lastPage - task.config.startPage + 1), task.config.endPage - task.config.startPage + 1);
-    },
-    reset: () => {
-      taskPageCache = null; taskDiagnostic = null; rows = []; previewRows = []; renderPreview();
-      els.rowCount.textContent = "待采集；已保存任务数据仍保留";
-    }
-  };
-  window.addEventListener("pagehide", () => { stopRequested = true; });
-  window.TKReviewDiagnosticsAPI = { report: diagnosticReport, probe: runProbes, clear: () => { diagnosticEvents.length = 0; probeResults = null; } };
-  window.addEventListener("error", event => logDiagnostic("uncaught-error", event.message));
-  window.addEventListener("unhandledrejection", event => logDiagnostic("unhandled-rejection", errorText(event.reason)));
-
-  els.startCapture.addEventListener("click", () => run(async () => {
-    await refreshActiveTabStatus(); await ensureCaptureScript();
-    await executeScript({ target: { tabId: activeTabId }, world: "MAIN", files: ["tiktok_capture_hook.js"] });
-    await verifyCaptureHook(); setStatus("监听已安装到当前页面；请创建任务开始采集，不会刷新页面。");
-  }));
-  els.readCapture.addEventListener("click", () => run(async () => {
-    await refreshActiveTabStatus();
-    await prepareProductFilter();
-    await readCapture();
-  }));
-  els.refreshStats.addEventListener("click", () => run(refreshStats));
-  els.fetchReviews.addEventListener("click", () => {
-    if (window.TKReviewTaskUI) window.TKReviewTaskUI.create();
-    else setStatus("任务面板尚未初始化，请重新打开侧栏并检查诊断。");
-  });
-  els.downloadCsv.addEventListener("click", () => {
-    if (window.TKReviewTaskUI) window.TKReviewTaskUI.exportXlsx();
-  });
-  els.clearData.addEventListener("click", () => {
-    if (isFetching) {
-      if (window.TKReviewTaskUI && window.TKReviewTaskUI.collectionRunner && window.TKReviewTaskUI.collectionRunner.active) window.TKReviewTaskUI.collectionRunner.pause();
-      else if (window.TKReviewTaskUI && window.TKReviewTaskUI.runner.active) window.TKReviewTaskUI.runner.pause();
-      stopRequested = true;
-      els.clearData.disabled = true;
-      setStatus("正在停止，等待当前页完成...");
-    } else {
-      clearData();
-    }
-  });
-
-  run(refreshActiveTabStatus);
+  // ---------------- 启动 ----------------
+  (async () => {
+    els.version.textContent = `v${VERSION}`;
+    try { await loadForm(); } catch (error) { logEvent("warn", `读取已保存的表单失败：${error.message}`); }
+    updateIdsUi();
+    const heads = PREVIEW_COLUMNS.map(([, label]) => { const th = document.createElement("th"); th.textContent = label; return th; });
+    els.previewHead.append(...heads);
+    try {
+      const tasks = await store.listTasks();
+      // 侧栏关闭会中断运行中的任务，标记为暂停以便继续
+      for (const t of tasks) if (t.status === "running") { t.status = "paused"; await store.putTask(t); }
+      if (tasks.length) await showTask(tasks[0].id); else await refreshTaskList();
+    } catch (error) { showError(error); }
+    try {
+      await useTab(false);
+      const status = await ensureHook();
+      els.pageStatus.textContent += ` · 监听正常${status.records ? `，已捕获 ${status.records} 个评论响应` : "，尚未捕获评论响应"}`;
+    } catch (error) { els.pageStatus.textContent = `未就绪：${error.message}`; }
+    controls();
+  })();
 })();

@@ -2,5 +2,5 @@
   "name": "tk-review-verification",
   "private": true,
   "scripts": { "test": "node --test *.test.cjs" },
-  "devDependencies": { "fake-indexeddb": "6.2.5", "playwright": "1.63.0" }
+  "devDependencies": { "playwright": "1.63.0" }
 }

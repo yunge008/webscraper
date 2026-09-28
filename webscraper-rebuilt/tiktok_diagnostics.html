@@ -10,16 +10,16 @@
 <body>
   <main class="tk-app">
     <h1>TK 评论诊断</h1>
-    <p>先打开目标店铺的商品评价页。探针只检查页面与监听状态，不刷新页面、不翻页。</p>
+    <p class="tk-muted">先打开目标店铺的商品评价页。探针与接口测试都不会刷新页面、不修改筛选条件。</p>
     <div class="tk-actions">
-      <button id="probe" type="button">运行探针</button>
-      <button id="refresh" type="button">刷新报告</button>
+      <button id="probe" type="button" class="tk-primary">运行探针</button>
+      <button id="testApi" type="button">测试接口直连</button>
       <button id="copy" type="button">复制诊断</button>
       <button id="download" type="button">下载报告</button>
       <button id="clear" type="button">清空日志</button>
     </div>
     <p id="diagnosticStatus" role="status">正在读取诊断信息…</p>
-    <p>报告包含浏览器版本、错误步骤、注入探针、响应字段结构及 HTTP 状态；不包含评论正文、请求参数、请求体或认证头内容。</p>
+    <p class="tk-muted">报告包含：扩展版本、错误与步骤日志、页面监听状态、评论接口的路径/参数名/分页识别、响应字段结构（只有字段名和类型，不含评论内容、参数值、Cookie 或认证头）。</p>
     <textarea id="report" readonly aria-label="诊断报告" spellcheck="false"></textarea>
   </main>
   <script src="tiktok_diagnostics.js"></script>
