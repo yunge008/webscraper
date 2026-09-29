@@ -407,10 +407,11 @@ test("e2e: current filter, product list, UI fallback, image & export", { timeout
       const expected = withImages.length * 2;
       // ZIP：一个压缩包，按商品 ID 分文件夹
       const [zipDl] = await Promise.all([panel.waitForEvent("download"), panel.click("#downloadImages")]);
-      assert.match(zipDl.suggestedFilename(), /\.zip$/);
       await panel.waitForFunction(() => /已打包/.test(document.getElementById("status").textContent), null, { timeout: 60000 });
       const Media = require("../webscraper-rebuilt/tiktok_media.js");
-      const zipFiles = await Media.readZip(fs.readFileSync(await zipDl.path()));
+      const zipBytes = fs.readFileSync(await zipDl.path());
+      assert.equal(zipBytes.slice(0, 2).toString(), "PK");
+      const zipFiles = await Media.readZip(zipBytes);
       assert.equal(zipFiles.length, expected);
       assert.ok(zipFiles.every(f => f.name.startsWith(`${P.C}/`) && /_\d\.(png|jpg)$/.test(f.name)), zipFiles.slice(0, 3).map(f => f.name).join(","));
       // Excel 含图片预览：缩略图嵌入评论表，可被 SheetJS 正常读取
