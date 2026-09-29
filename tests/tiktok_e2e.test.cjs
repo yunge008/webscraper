@@ -90,6 +90,10 @@ async function handleApi(route) {
   globalThis.__nonces.add(body.nonce);
   if (mode.nonceCheck && replayed) return route.fulfill({ status: 200, contentType: "application/json", body: '{"code":40002,"message":"replay rejected"}' });
   const size = Math.min(Number(body.page_size) || 20, mode.maxSize || 100);
+  if (mode.emptyOnce && Number(body.page) === mode.emptyOnce && !globalThis.__emptied) {
+    globalThis.__emptied = true;
+    return route.fulfill({ status: 200, contentType: "application/json", body: `{"code":0,"data":{"list":[],"total":${filterReviews(body).length}}}` });
+  }
   const page = Number(body.page) || 1;
   const all = filterReviews(body);
   const list = all.slice((page - 1) * size, page * size);
@@ -148,6 +152,7 @@ async function fillForm(panel, values) {
   await panel.fill("#batchSize", String(values.batchSize || 50));
   await panel.fill("#delayMs", "0");
   await panel.selectOption("#driver", values.driver || "auto");
+  await panel.setChecked("#reloadEachBatch", !!values.reload);
 }
 
 test("e2e: current filter, product list, UI fallback, image & export", { timeout: 600000, skip: !chromePath && "Chromium not found" }, async t => {
@@ -175,6 +180,12 @@ test("e2e: current filter, product list, UI fallback, image & export", { timeout
       assert.match(withImg["评价图链接"], /~tplv-origin\.jpeg/);
       assert.doesNotMatch(withImg["评价图链接"], /product\.jpeg|thumb/);
       assert.equal(sheetRows(book, "评价图").length, expected.reduce((n, r) => n + r.images, 0));
+      const judge = sheetRows(book, "Judge.me导入");
+      assert.equal(judge.length, expected.length);
+      const withPics = judge.find(r => r.picture_urls);
+      assert.equal(withPics.picture_urls.split(",").length, 2);
+      assert.match(withPics.picture_urls, /~tplv-origin\.jpeg/);
+      assert.ok(judge.every(r => r.rating >= 1 && r.rating <= 5 && r.curated === "ok"));
       // 页面筛选没有被改动
       assert.equal(await seller.inputValue("#startDay"), "5");
     });
@@ -283,8 +294,30 @@ test("e2e: current filter, product list, UI fallback, image & export", { timeout
       assert.equal(rows[LARGE - 1]["评论 ID"], (7500000000000000000n + BigInt(LARGE - 1)).toString());
     });
 
+    await t.test("a transient empty page mid-run is retried, not treated as the end", async () => {
+      globalThis.__serverMode = { emptyOnce: 3 }; globalThis.__emptied = false;
+      await seller.fill("#kw", ""); await seller.fill("#startDay", ""); await seller.fill("#endDay", ""); await seller.click("#query"); await seller.waitForTimeout(500);
+      await fillForm(panel, { mode: "ids", ids: P.A, pageSize: 20 });
+      const result = await runAndWait(panel);
+      assert.equal(result.error, "", result.error);
+      assert.ok(globalThis.__emptied, "server served the empty page");
+      assert.equal(Number(result.rows), 130);
+    });
+
     await t.test("the seller page was never reloaded by the extension", async () => {
       assert.equal(seller.__loads, 0);
+    });
+
+    await t.test("reload the page after each batch; saved filters still apply", async () => {
+      globalThis.__serverMode = {};
+      await seller.fill("#kw", ""); await seller.fill("#startDay", "5"); await seller.fill("#endDay", "20"); await seller.click("#query"); await seller.waitForTimeout(500);
+      const loadsBefore = seller.__loads;
+      await fillForm(panel, { mode: "current", pageSize: 20, batchSize: 2, reload: true });
+      const result = await runAndWait(panel, 180000);
+      assert.equal(result.error, "", result.error);
+      const expected = REVIEWS.filter(r => r.day >= 5 && r.day <= 20).length;
+      assert.equal(Number(result.rows), expected);
+      assert.ok(seller.__loads - loadsBefore >= 2, `page reloaded ${seller.__loads - loadsBefore} times`);
     });
 
     await t.test("download review images to disk", async () => {

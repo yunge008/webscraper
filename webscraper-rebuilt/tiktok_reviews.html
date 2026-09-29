@@ -34,7 +34,7 @@
 			<div class="tk-grid">
 				<label>起始页<input id="startPage" type="number" min="1" value="1"></label>
 				<label>终止页<input id="endPage" type="number" min="1" placeholder="全部"></label>
-				<label>每页条数<input id="pageSize" type="number" min="1" max="100" value="50"></label>
+				<label>每页条数<input id="pageSize" type="number" min="1" max="200" value="50"></label>
 				<label>每批页数<input id="batchSize" type="number" min="1" max="1000" value="50"></label>
 				<label>页间隔(ms)<input id="delayMs" type="number" min="0" max="10000" value="600"></label>
 				<label>翻页方式
@@ -45,7 +45,8 @@
 					</select>
 				</label>
 			</div>
-			<p class="tk-muted">终止页留空 = 采集全部页。“每页条数”仅在接口直连时生效；页面点击模式沿用页面当前每页条数。</p>
+			<label class="tk-radio"><input id="reloadEachBatch" type="checkbox" checked> 每批结束后刷新评价页释放内存（仅接口直连；筛选条件已保存在任务中，不受影响）</label>
+			<p class="tk-muted">终止页留空 = 采集全部页。“每页条数”仅在接口直连时生效，最大 200，服务器若有上限会自动按实际条数继续；页面点击模式沿用页面当前每页条数。</p>
 
 			<div class="tk-actions">
 				<button id="createTask" type="button" class="tk-primary">创建并开始任务</button>

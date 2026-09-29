@@ -10,7 +10,7 @@
   const store = new window.TKStore();
   const $ = id => document.getElementById(id);
   const els = {};
-  for (const id of ["version", "pageStatus", "errorBanner", "idsBox", "productIds", "idFile", "idCount", "startPage", "endPage", "pageSize", "batchSize", "delayMs", "driver", "createTask", "pauseTask", "resumeTask", "statTotal", "statRows", "statImages", "statDriver", "progress", "status", "taskSelect", "taskInfo", "exportXlsx", "downloadImages", "deleteTask", "rowCount", "previewHead", "previewBody"]) els[id] = $(id);
+  for (const id of ["version", "pageStatus", "errorBanner", "idsBox", "productIds", "idFile", "idCount", "startPage", "endPage", "pageSize", "batchSize", "delayMs", "driver", "reloadEachBatch", "createTask", "pauseTask", "resumeTask", "statTotal", "statRows", "statImages", "statDriver", "progress", "status", "taskSelect", "taskInfo", "exportXlsx", "downloadImages", "deleteTask", "rowCount", "previewHead", "previewBody"]) els[id] = $(id);
   const VERSION = chrome.runtime.getManifest().version;
   const FORM_KEY = "tkReviewForm";
   const PREVIEW_COLUMNS = C.OUTPUT_COLUMNS.filter(([key]) => key !== "review_image_urls");
@@ -175,7 +175,7 @@
     });
     sentReplays.add(replayKey(spec.url, spec.body));
     if (sentReplays.size > 500) sentReplays.delete(sentReplays.values().next().value);
-    const res = await hook("replay", spec);
+    const res = task.replayWorld === "MAIN" ? await hook("replay", spec) : await exec(isolatedReplay, [spec], "ISOLATED", 60000);
     if (!res || !res.status) throw kindError("retry", `接口请求失败：${res && res.error || "无响应"}`);
     if (res.status === 401 || res.status === 403) throw kindError("fatal", `评论接口 HTTP ${res.status}：登录失效或无权限，请在页面重新登录后点“继续”。`);
     if (res.status === 429) throw kindError("ratelimit", "评论接口限流（HTTP 429）");
@@ -187,6 +187,33 @@
     const payload = C.findReviewPayload(json);
     if (!payload) throw kindError("api", "接口响应中没有评论列表");
     return payload;
+  }
+  // 在内容脚本（ISOLATED world）中直接请求：同源、带登录 Cookie，但不经过页面自身的 JS，
+  // 不会让页面的监控 SDK 累积几千个请求的数据。
+  function isolatedReplay(spec) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), spec.timeout || 30000);
+    const init = { method: spec.method, headers: spec.headers || {}, credentials: "include", signal: controller.signal };
+    if (spec.body != null && !/^(GET|HEAD)$/.test(spec.method)) init.body = spec.body;
+    return fetch(spec.url, init).then(r => r.text().then(text => ({ status: r.status, text })))
+      .catch(error => ({ status: 0, text: "", error: String(error && error.message || error) }))
+      .finally(() => clearTimeout(timer));
+  }
+  async function reloadTab(reason) {
+    setStatus(`${reason}：正在刷新评价页释放内存…`);
+    await chrome.tabs.reload(tabId);
+    const end = Date.now() + 60000;
+    await sleep(1000);
+    while (Date.now() < end) {
+      let tab;
+      try { tab = await chrome.tabs.get(tabId); } catch (_) { throw kindError("fatal", "评价页标签已关闭，任务已暂停。"); }
+      if (tab.status === "complete") break;
+      await sleep(500);
+    }
+    await pausableSleep(3000);
+    await ensureHook();
+    if (running) running.pageReloaded = true;
+    logEvent("info", `已刷新评价页（${reason}）。`);
   }
   async function withRetry(fn) {
     let lastError;
@@ -331,7 +358,7 @@
   }
 
   async function runItem(task, item, itemIndex) {
-    const ctx = { positioned: false, apiOk: 0, apiFailed: false, variant: 0 };
+    const ctx = { positioned: false, apiOk: 0, apiFailed: false, variant: 0, reloaded: false };
     const sizeOf = () => item.sizeOverride || task.sizeUsed;
     let mode = decideDriver(task, item);
     let prevSig = item.lastSig || "";
@@ -352,7 +379,16 @@
           if (task.pagination.kind === "cursor" && !task.pagination.pagePath && page > 1 && !item.cursor) {
             for (let p = 1; p < page; p++) item.cursor = (await withRetry(() => apiFetchPage(task, item, p))).nextCursor;
           }
-          payload = await withRetry(() => apiFetchPage(task, item, page));
+          payload = await withRetry(async () => {
+            const p = await apiFetchPage(task, item, page);
+            // 总数显示后面还有很多页，本页却为空或不足一页：视为异常重试，不能当作采集结束
+            const size = sizeOf() || item.firstPageSize || 0;
+            const expected = p.total && size ? Math.ceil(p.total / size) : 0;
+            if (ctx.apiOk > 0 && size && p.list.length < size && expected && page < expected - 1) {
+              throw kindError("retry", `第 ${page} 页只返回 ${p.list.length} 条，但接口总数显示还有约 ${expected - page} 页`);
+            }
+            return p;
+          });
           const rows = payload.list.map(C.flattenReview);
           if (item.targetId && rows.some(row => !C.rowMatchesProduct(row, item.targetId))) throw kindError("api", "接口返回了其他商品的评论（商品参数未生效）");
           if (rows.length && C.payloadSignature(rows) === prevSig) throw kindError("api", "接口翻页参数未生效（与上一页相同）");
@@ -363,24 +399,31 @@
             if (item.sizeOverride) item.sizeOverride = rows.length; else task.sizeUsed = rows.length;
             if (page > 1) { continue; } // 页码含义随条数变化，重新请求本页
           }
-          ctx.apiOk++;
+          ctx.apiOk++; ctx.reloaded = false;
         } catch (error) {
           if (error.kind === "fatal" || error.kind === "paused") throw error;
+          // 已经跑通过的任务中途出错：刷新评价页后重试一次；仍失败则暂停（可“继续”），不改用逐页点击
+          if (ctx.apiOk > 0) {
+            if (!ctx.reloaded) { ctx.reloaded = true; await reloadTab(`第 ${page} 页请求异常（${error.message}）`); continue; }
+            throw kindError("fatal", `第 ${page} 页多次重试仍失败：${error.message}。已保存前面的页，点“继续”可从第 ${page} 页接着采集。`);
+          }
           // 首页失败时依次尝试：去除签名参数 → 页面原每页条数 → 两者同时
           if (ctx.apiOk === 0 && error.kind !== "ratelimit") {
             if (ctx.canResize === undefined) ctx.canResize = !!(task.pagination.pageSize && sizeOf() !== task.pagination.pageSize);
-            const variants = [{ strip: true }, { strip: false, resize: true }, { strip: true, resize: true }].filter(v => !v.resize || ctx.canResize);
+            const base = [{ world: "MAIN", strip: false }, { world: "MAIN", strip: true }];
+            const variants = base.concat(ctx.canResize ? [{ world: "ISOLATED", strip: false, resize: true }, ...base.map(v => ({ ...v, resize: true }))] : []);
             if (ctx.variant < variants.length) {
               const v = variants[ctx.variant++];
-              task.stripSign = v.strip;
+              task.replayWorld = v.world; task.stripSign = v.strip;
               if (v.resize) { task.sizeUsed = task.pagination.pageSize; item.sizeOverride = 0; }
-              logEvent("warn", `接口直连失败（${error.message}），改为${v.strip ? "去除签名参数" : "保留签名参数"}${v.resize ? `、每页 ${task.sizeUsed} 条` : ""}重试。`);
+              logEvent("warn", `接口直连失败（${error.message}），改为${v.world === "MAIN" ? "页面内请求" : "扩展直接请求"}${v.strip ? "（去除签名参数）" : ""}${v.resize ? `、每页 ${task.sizeUsed} 条` : ""}重试。`);
               continue;
             }
           }
           if (task.config.driver === "api") throw error;
+          if (task.pageReloaded) throw kindError("fatal", `接口直连失败（${error.message}）。评价页已被刷新过、页面上的筛选已重置，为避免采集条件改变，不改用页面点击。请稍后点“继续”重试。`);
           logEvent("warn", `接口直连不可用（${error.message}），切换为页面点击翻页。`);
-          task.stripSign = false;
+          task.stripSign = false; task.replayWorld = "";
           mode = "ui"; ctx.positioned = false; ctx.apiFailed = true;
           if (item.pages && task.pagination.pageSize && sizeOf() && sizeOf() !== task.pagination.pageSize && task.config.startPage === 1) {
             // 接口与页面每页条数不同，页码无法对应：页面点击从第 1 页重新采集（按评论 ID 去重）
@@ -457,6 +500,7 @@
       if (pagesThisRun % task.config.batchSize === 0) {
         setStatus(`${label}：本轮第 ${pagesThisRun / task.config.batchSize} 批（${task.config.batchSize} 页）已采完，已保存 ${task.rowCount || 0} 条，稍候继续…`);
         await pausableSleep(3000);
+        if (mode === "api" && task.config.reloadEachBatch !== false && !pauseRequested) await reloadTab(`第 ${pagesThisRun / task.config.batchSize} 批结束`);
       } else await pausableSleep(task.config.delayMs);
     }
     item.status = item.rows || item.pages ? "done" : "empty";
@@ -519,10 +563,11 @@
       ids: els.productIds.value,
       startPage: num(els.startPage, 1, 1, 100000),
       endPage: els.endPage.value.trim() ? num(els.endPage, 0, 1, 100000) : 0,
-      pageSize: num(els.pageSize, 50, 1, 100),
+      pageSize: num(els.pageSize, 50, 1, 200),
       batchSize: num(els.batchSize, 50, 1, 1000),
       delayMs: num(els.delayMs, 600, 0, 10000),
-      driver: els.driver.value
+      driver: els.driver.value,
+      reloadEachBatch: els.reloadEachBatch.checked
     };
   }
   async function createTask() {
@@ -557,7 +602,7 @@
       id: crypto.randomUUID(), createdAt: now, updatedAt: now,
       mode: form.mode,
       name: form.mode === "current" ? "当前筛选" : ids.length === 1 ? `商品 ${ids[0]}` : `商品列表 ${ids.length} 个`,
-      config: { startPage: form.startPage, endPage: form.endPage, pageSize: form.pageSize, batchSize: form.batchSize, delayMs: form.delayMs, driver: form.driver },
+      config: { startPage: form.startPage, endPage: form.endPage, pageSize: form.pageSize, batchSize: form.batchSize, delayMs: form.delayMs, driver: form.driver, reloadEachBatch: form.reloadEachBatch },
       template: null, pagination: null, productPath: null, stripSign: false, driverUsed: "",
       items: ids.map(id => ({ targetId: id, status: "pending", nextPage: form.startPage, cursor: "", total: null, totalPages: 0, rows: 0, pages: 0, error: "" })),
       index: 0, status: "paused", rowCount: 0, imageCount: 0, lastError: ""
@@ -607,11 +652,25 @@
       for (const item of task.items) summary.push([item.targetId, names[item.status] || item.status, item.total == null ? "" : item.total, item.rows || 0, item.pages || 0, item.error || ""]);
       XLSX.utils.book_append_sheet(book, textSheet(summary, [21, 8, 10, 10, 10, 60]), "商品汇总");
     }
-    const info = [["项目", "值"], ["任务", task.name], ["创建时间", new Date(task.createdAt).toLocaleString()], ["状态", task.status], ["评论条数", records.length], ["评价图数量", images.length - 1], ["页码范围", `${task.config.startPage} - ${task.config.endPage || "全部"}`], ["翻页方式", task.driverUsed === "api" ? "接口直连" : "页面点击"], ["接口", task.template ? endpointOf(task.template.url) : ""], ["错误", task.lastError || ""]];
+    // Judge.me 导入：列顺序按 Judge.me CSV 模板；product_handle 需填 Shopify 商品 handle（第一列辅助列导入前删除）
+    const judge = [["TikTok商品ID（导入前删除此列）", "title", "body", "rating", "review_date", "source", "curated", "reviewer_name", "reviewer_email", "product_id", "product_handle", "reply", "reply_date", "picture_urls", "ip_address", "location"]];
+    for (const r of records) {
+      const row = r.row;
+      judge.push([row.product_id || r.targetId || "", "", row.review_text || "", Number(row.star_level) || "", row.create_time || "", "", "ok", row.user_name || "", "", "", "", row.reply_text || "", "", (row.review_images || []).map(img => img.url).join(","), "", ""]);
+    }
+    XLSX.utils.book_append_sheet(book, textSheet(judge, [21, 10, 50, 6, 19, 8, 6, 14, 20, 10, 24, 30, 12, 80, 8, 8]), "Judge.me导入");
+    // 图片链接的签名有效期（x-expires / expires 参数，秒级时间戳）
+    let expiry = 0;
+    for (const r of records) for (const img of r.row.review_images || []) {
+      const m = img.url.match(/[?&](?:x-expires|expires)=(\d{9,10})/i);
+      if (m && (!expiry || Number(m[1]) < expiry)) expiry = Number(m[1]);
+    }
+    const expiryText = expiry ? new Date(expiry * 1000).toLocaleString() : "链接中未发现有效期参数";
+    const info = [["项目", "值"], ["评价图链接最早过期时间", expiryText], ["任务", task.name], ["创建时间", new Date(task.createdAt).toLocaleString()], ["状态", task.status], ["评论条数", records.length], ["评价图数量", images.length - 1], ["页码范围", `${task.config.startPage} - ${task.config.endPage || "全部"}`], ["翻页方式", task.driverUsed === "api" ? "接口直连" : "页面点击"], ["接口", task.template ? endpointOf(task.template.url) : ""], ["错误", task.lastError || ""]];
     XLSX.utils.book_append_sheet(book, textSheet(info, [12, 60]), "任务信息");
     const out = XLSX.write(book, { bookType: "xlsx", type: "array", compression: true });
     download(new Blob([out], { type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" }), `TK评论_${safeName(task.name)}_${stamp(task.createdAt)}.xlsx`);
-    setStatus(`已导出 ${records.length} 条评论、${images.length - 1} 张评价图链接。`);
+    setStatus(`已导出 ${records.length} 条评论、${images.length - 1} 张评价图链接。${expiry ? `图片链接最早 ${expiryText} 过期，导入 Judge.me 等平台请在此之前完成。` : ""}`);
   }
   async function downloadImages(task) {
     if (!chrome.downloads) throw new Error("浏览器未授予下载权限，请在扩展管理中重新加载扩展。");
@@ -661,14 +720,18 @@
     const task = selectedTask;
     els.createTask.disabled = busy;
     els.pauseTask.disabled = !busy;
-    els.resumeTask.disabled = busy || !task || task.status === "done";
+    els.resumeTask.disabled = busy || !task || (task.status === "done" && !hasRemaining(task));
     els.exportXlsx.disabled = busy && !running ? true : !task;
     els.downloadImages.disabled = busy || !task || !task.imageCount;
     els.deleteTask.disabled = busy || !task;
     els.taskSelect.disabled = busy;
-    for (const el of document.querySelectorAll("input[name=mode], #productIds, #idFile, #startPage, #endPage, #pageSize, #batchSize, #delayMs, #driver")) el.disabled = busy;
+    for (const el of document.querySelectorAll("input[name=mode], #productIds, #idFile, #startPage, #endPage, #pageSize, #batchSize, #delayMs, #driver, #reloadEachBatch")) el.disabled = busy;
   }
   let selectedTask = null;
+  function itemRemaining(task, item) {
+    return !!(item.totalPages && item.nextPage <= item.totalPages && !(task.config.endPage && item.nextPage > task.config.endPage));
+  }
+  function hasRemaining(task) { return task.items.some(item => item.status !== "empty" && itemRemaining(task, item)); }
   const STATUS = { running: "运行中", paused: "已暂停", done: "已完成", error: "出错暂停" };
   async function refreshTaskList() {
     const tasks = await store.listTasks();
@@ -717,6 +780,7 @@
     els.batchSize.value = form.batchSize || 50;
     els.delayMs.value = form.delayMs ?? 600;
     els.driver.value = form.driver || "auto";
+    els.reloadEachBatch.checked = form.reloadEachBatch !== false;
   }
   function updateIdsUi() {
     const mode = document.querySelector("input[name=mode]:checked").value;
@@ -738,7 +802,10 @@
   els.resumeTask.addEventListener("click", action(async () => {
     const task = await store.getTask(selectedId);
     if (!task) throw new Error("请选择要继续的任务。");
-    for (const item of task.items) if (item.status === "error") { item.status = "pending"; item.error = ""; }
+    for (const item of task.items) {
+      if (item.status === "error") { item.status = "pending"; item.error = ""; }
+      if (item.status === "done" && itemRemaining(task, item)) item.status = "pending"; // 旧版本中途误判结束的任务
+    }
     if (task.status === "done" && task.items.every(i => i.status === "done" || i.status === "empty")) throw new Error("任务已完成。");
     task.index = task.items.findIndex(i => i.status !== "done" && i.status !== "empty");
     await runTask(task);
@@ -755,7 +822,7 @@
     await store.deleteTask(selectedId); selectedId = ""; preview = []; renderPreview(); await refreshTaskList(); setStatus("任务已删除。");
   }));
   for (const radio of document.querySelectorAll("input[name=mode]")) radio.addEventListener("change", () => { updateIdsUi(); saveForm(); });
-  for (const el of [els.productIds, els.startPage, els.endPage, els.pageSize, els.batchSize, els.delayMs, els.driver]) el.addEventListener("change", saveForm);
+  for (const el of [els.productIds, els.startPage, els.endPage, els.pageSize, els.batchSize, els.delayMs, els.driver, els.reloadEachBatch]) el.addEventListener("change", saveForm);
   els.productIds.addEventListener("input", () => { updateIdsUi(); saveForm(); });
   els.idFile.addEventListener("change", action(async () => {
     const file = els.idFile.files[0];
@@ -815,11 +882,11 @@
     const latest = await hook("latest", false);
     if (!latest) throw new Error("还没有捕获到评论接口响应。请在评价页点一次查询或翻页。");
     const form = readForm();
-    for (const stripSign of [false, true]) {
-      const task = { config: { pageSize: form.pageSize }, stripSign };
+    for (const [replayWorld, stripSign] of [["ISOLATED", false], ["MAIN", false], ["MAIN", true]]) {
+      const task = { config: { pageSize: form.pageSize }, stripSign, replayWorld };
       setupTemplate(task, templateOf(latest));
       out.template = C.describeTemplate(task.template, { activePage: latest.activePage });
-      const result = { stripSign };
+      const result = { replayWorld, stripSign };
       try {
         const item = { targetId: "", cursor: "" };
         const p1 = await apiFetchPage(task, item, 1);

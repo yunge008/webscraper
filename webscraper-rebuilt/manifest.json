@@ -3,7 +3,7 @@
   "name": "web scraper rebuild",
   "short_name": "web scraper rebuild",
   "description": "增加TK商品评论批量采集（当前筛选 / 指定商品ID / Excel列表、评价图、分批续采）",
-  "version": "1.108.0",
+  "version": "1.108.1",
   "minimum_chrome_version": "120",
   "default_locale": "en",
   "action": {

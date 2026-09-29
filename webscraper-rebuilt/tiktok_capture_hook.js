@@ -2,7 +2,7 @@
 // 通过 manifest 在 document_start 注入；旧页面也可由侧栏用 executeScript 补注入。
 (function() {
   if (window.__TKR__ && window.__TKR__.version >= 3) return;
-  const MAX = 25;
+  const MAX = 12;
   const state = {
     version: 3,
     installedAt: Date.now(),
@@ -36,6 +36,8 @@
       const relevant = /review|rating|comment/i.test(meta.url);
       if (!relevant && !looksReviewText(text || "")) return;
       push(state.network, { seq: meta.seq, url: meta.url.split("?")[0], method: meta.method, transport: meta.transport, status, bytes: (text || "").length, replay: !!meta.replay, at: Date.now() }, 60);
+      // 扩展自己的重放请求直接返回给侧栏，不在页面内保留响应，避免长任务占用页面内存
+      if (meta.replay) return;
       if (!looksReviewText(text || "") && !/"(list|reviews)"\s*:\s*\[\s*\]/.test(text || "")) return;
       push(state.records, {
         seq: meta.seq, transport: meta.transport, method: meta.method, url: meta.url,
