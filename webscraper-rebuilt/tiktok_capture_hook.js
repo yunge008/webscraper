@@ -72,18 +72,20 @@
   }
 
   // ---- XHR ----
+  // 每个监听实例用独立的 Symbol 保存请求信息，避免页面上存在多个监听副本时互相覆盖
+  const META = Symbol("tkMeta");
   const XHR = XMLHttpRequest.prototype;
   const nativeOpen = XHR.open, nativeSend = XHR.send, nativeSetHeader = XHR.setRequestHeader;
   XHR.open = function(method, url) {
-    this.__tkMeta = { transport: "xhr", method: String(method || "GET").toUpperCase(), url: absUrl(url), headers: {}, replay: !!this.__tkReplay };
+    this[META] = { transport: "xhr", method: String(method || "GET").toUpperCase(), url: absUrl(url), headers: {}, replay: !!this.__tkReplay };
     return nativeOpen.apply(this, arguments);
   };
   XHR.setRequestHeader = function(name, value) {
-    if (this.__tkMeta) this.__tkMeta.headers[name] = value;
+    if (this[META]) this[META].headers[name] = value;
     return nativeSetHeader.apply(this, arguments);
   };
   XHR.send = function(body) {
-    const meta = this.__tkMeta;
+    const meta = this[META];
     if (meta) {
       meta.seq = ++state.seq; meta.activePage = activePage(); meta.body = bodyText(body);
       this.addEventListener("loadend", () => {
@@ -202,10 +204,14 @@
     next.click();
     return { ok: true, from: info.activePage };
   }
+  // 跳到指定页：可见则直接点；有跳页输入框则输入；否则向目标方向点“…”或最接近的页码，
+  // 返回 partial=true 表示只前进了一步，侧栏会等响应后再次调用。
   function clickPage(page) {
-    const item = Array.from(document.querySelectorAll("[class*='pagination-item']")).find(el => visible(el) && parseInt((el.textContent || "").trim(), 10) === page);
-    if (item) { item.click(); return { ok: true, via: "item" }; }
-    const jumper = Array.from(document.querySelectorAll("[class*='pagination'] input")).find(visible);
+    const items = Array.from(document.querySelectorAll("[class*='pagination-item']")).filter(visible);
+    const numbered = items.map(el => ({ el, n: parseInt((el.textContent || "").trim(), 10) })).filter(x => Number.isFinite(x.n) && x.n > 0 && String(x.n) === (x.el.textContent || "").trim());
+    const exact = numbered.find(x => x.n === page);
+    if (exact) { exact.el.click(); return { ok: true, via: "item" }; }
+    const jumper = Array.from(document.querySelectorAll("[class*='pagination-jumper'] input, [class*='pagination-options'] [class*='jumper'] input")).find(el => visible(el) && !el.readOnly && !el.disabled);
     if (jumper) {
       const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value").set;
       jumper.focus(); setter.call(jumper, String(page));
@@ -213,7 +219,17 @@
       fireEnter(jumper); jumper.blur();
       return { ok: true, via: "jumper" };
     }
-    return { ok: false, error: `分页中找不到第 ${page} 页，也没有跳页输入框` };
+    const current = activePage();
+    const activeEl = items.find(el => /pagination-item-active/.test(String(el.className)));
+    const forward = page > current;
+    // “…”省略号（Arco：点击前进/后退 5 页）
+    const ellipses = items.filter(el => /jumper|jump-next|jump-prev|ellipsis|more/i.test(String(el.className)) && !/pagination-item-(next|prev)\b/.test(String(el.className)));
+    const ellipsis = ellipses.find(el => !activeEl || Boolean(activeEl.compareDocumentPosition(el) & (forward ? Node.DOCUMENT_POSITION_FOLLOWING : Node.DOCUMENT_POSITION_PRECEDING)));
+    // 最接近目标、且在当前页与目标页之间的可见页码
+    const between = numbered.filter(x => forward ? x.n > current && x.n < page : x.n < current && x.n > page).sort((a, b) => forward ? b.n - a.n : a.n - b.n)[0];
+    if (ellipsis && (!between || Math.abs(page - current) > 5)) { ellipsis.click(); return { ok: true, partial: true, via: "ellipsis", from: current }; }
+    if (between) { between.el.click(); return { ok: true, partial: true, via: "item-step", to: between.n }; }
+    return { ok: false, error: `分页中找不到第 ${page} 页，也无法向其靠近` };
   }
 
   // 侧栏读取：返回 seq 之后的新记录（可选择是否包含重放）

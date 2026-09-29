@@ -297,12 +297,19 @@
       if (page === 1) return first.payload;
       prevSig = C.payloadSignature(first.payload.list.map(C.flattenReview));
       setStatus(`页面点击：跳转到第 ${page} 页…`);
-      const before = (await hook("status")).seq;
-      const jump = await hook("clickPage", page);
-      if (jump.ok) {
-        const found = await uiWaitAfter(before, prevSig, `跳转第 ${page} 页`);
+      let lastPayload = first.payload;
+      for (let step = 0; step < 3000; step++) {
+        if (pauseRequested) throw kindError("paused", "已暂停");
         const info = await hook("paginationInfo");
-        if (!info.activePage || info.activePage === page) { ctx.uiPage = page; return found.payload; }
+        if (info.activePage === page) { ctx.uiPage = page; return lastPayload; }
+        const before = (await hook("status")).seq;
+        const jump = await hook("clickPage", page);
+        if (!jump.ok) break;
+        const found = await uiWaitAfter(before, C.payloadSignature(lastPayload.list.map(C.flattenReview)), `跳转第 ${page} 页`);
+        lastPayload = found.payload;
+        const now = await hook("paginationInfo");
+        if (!jump.partial && (!now.activePage || now.activePage === page)) { ctx.uiPage = page; return found.payload; }
+        if (step % 5 === 0) setStatus(`页面点击：正在跳转到第 ${page} 页（当前第 ${now.activePage} 页）…`);
       }
       // 逐页点击到目标页（不保存中间页）
       let payload = first.payload;
@@ -381,11 +388,14 @@
           }
           payload = await withRetry(async () => {
             const p = await apiFetchPage(task, item, page);
-            // 总数显示后面还有很多页，本页却为空或不足一页：视为异常重试，不能当作采集结束
+            // TikTok 接口中途的页可能不足一页（隐藏/删除的评论仍计入总数），这是正常的；
+            // 只有“空页”且总数显示后面还有很多页时才视为异常重试。
             const size = sizeOf() || item.firstPageSize || 0;
             const expected = p.total && size ? Math.ceil(p.total / size) : 0;
-            if (ctx.apiOk > 0 && size && p.list.length < size && expected && page < expected - 1) {
-              throw kindError("retry", `第 ${page} 页只返回 ${p.list.length} 条，但接口总数显示还有约 ${expected - page} 页`);
+            if (!p.list.length && expected && page < expected) {
+              const error = kindError("retry", `第 ${page} 页返回空列表，但接口总数显示还有约 ${expected - page + 1} 页`);
+              error.emptyPayload = p;
+              throw error;
             }
             return p;
           });
@@ -394,7 +404,9 @@
           if (rows.length && C.payloadSignature(rows) === prevSig) throw kindError("api", "接口翻页参数未生效（与上一页相同）");
           if (!rows.length && page === 1 && payload.total !== 0 && payload.total !== null) throw kindError("api", "接口第 1 页为空但总数不为 0");
           // 服务器可能限制每页条数：以实际返回为准，避免误判为最后一页
-          if (ctx.apiOk === 0 && sizeOf() && rows.length < sizeOf() && payload.total && payload.total > (page - 1) * sizeOf() + rows.length) {
+          // 只有请求条数大于页面自身每页条数、且返回条数不少于页面条数时，才判定为服务器上限（避免把正常的不足一页误判）
+          const pageOwn = task.pagination.pageSize || 0;
+          if (ctx.apiOk === 0 && sizeOf() && pageOwn && sizeOf() > pageOwn && rows.length < sizeOf() && rows.length >= pageOwn && payload.total && payload.total > (page - 1) * sizeOf() + rows.length) {
             logEvent("warn", `接口每页实际返回 ${rows.length} 条（请求 ${sizeOf()} 条），按 ${rows.length} 条继续。`);
             if (item.sizeOverride) item.sizeOverride = rows.length; else task.sizeUsed = rows.length;
             if (page > 1) { continue; } // 页码含义随条数变化，重新请求本页
@@ -405,32 +417,39 @@
           // 已经跑通过的任务中途出错：刷新评价页后重试一次；仍失败则暂停（可“继续”），不改用逐页点击
           if (ctx.apiOk > 0) {
             if (!ctx.reloaded) { ctx.reloaded = true; await reloadTab(`第 ${page} 页请求异常（${error.message}）`); continue; }
-            throw kindError("fatal", `第 ${page} 页多次重试仍失败：${error.message}。已保存前面的页，点“继续”可从第 ${page} 页接着采集。`);
+            // 刷新后仍是空页：跳过该页继续（最多连续 3 页），而不是整个任务停下
+            if (error.emptyPayload && (ctx.emptySkips || 0) < 3) {
+              ctx.emptySkips = (ctx.emptySkips || 0) + 1;
+              logEvent("warn", `第 ${page} 页多次返回空列表，已跳过继续下一页。`);
+              payload = { ...error.emptyPayload, skipped: true };
+            } else throw kindError("fatal", `第 ${page} 页多次重试仍失败：${error.message}。已保存前面的页，点“继续”可从第 ${page} 页接着采集。`);
           }
-          // 首页失败时依次尝试：去除签名参数 → 页面原每页条数 → 两者同时
-          if (ctx.apiOk === 0 && error.kind !== "ratelimit") {
-            if (ctx.canResize === undefined) ctx.canResize = !!(task.pagination.pageSize && sizeOf() !== task.pagination.pageSize);
-            const base = [{ world: "MAIN", strip: false }, { world: "MAIN", strip: true }];
-            const variants = base.concat(ctx.canResize ? [{ world: "ISOLATED", strip: false, resize: true }, ...base.map(v => ({ ...v, resize: true }))] : []);
-            if (ctx.variant < variants.length) {
-              const v = variants[ctx.variant++];
-              task.replayWorld = v.world; task.stripSign = v.strip;
-              if (v.resize) { task.sizeUsed = task.pagination.pageSize; item.sizeOverride = 0; }
-              logEvent("warn", `接口直连失败（${error.message}），改为${v.world === "MAIN" ? "页面内请求" : "扩展直接请求"}${v.strip ? "（去除签名参数）" : ""}${v.resize ? `、每页 ${task.sizeUsed} 条` : ""}重试。`);
-              continue;
+          if (!(payload && payload.skipped)) {
+            // 首页失败时依次尝试：去除签名参数 → 页面原每页条数 → 两者同时
+            if (ctx.apiOk === 0 && error.kind !== "ratelimit") {
+              if (ctx.canResize === undefined) ctx.canResize = !!(task.pagination.pageSize && sizeOf() !== task.pagination.pageSize);
+              const base = [{ world: "MAIN", strip: false }, { world: "MAIN", strip: true }];
+              const variants = base.concat(ctx.canResize ? [{ world: "ISOLATED", strip: false, resize: true }, ...base.map(v => ({ ...v, resize: true }))] : []);
+              if (ctx.variant < variants.length) {
+                const v = variants[ctx.variant++];
+                task.replayWorld = v.world; task.stripSign = v.strip;
+                if (v.resize) { task.sizeUsed = task.pagination.pageSize; item.sizeOverride = 0; }
+                logEvent("warn", `接口直连失败（${error.message}），改为${v.world === "MAIN" ? "页面内请求" : "扩展直接请求"}${v.strip ? "（去除签名参数）" : ""}${v.resize ? `、每页 ${task.sizeUsed} 条` : ""}重试。`);
+                continue;
+              }
             }
+            if (task.config.driver === "api") throw error;
+            if (task.pageReloaded) throw kindError("fatal", `接口直连失败（${error.message}）。评价页已被刷新过、页面上的筛选已重置，为避免采集条件改变，不改用页面点击。请稍后点“继续”重试。`);
+            logEvent("warn", `接口直连不可用（${error.message}），切换为页面点击翻页。`);
+            task.stripSign = false; task.replayWorld = "";
+            mode = "ui"; ctx.positioned = false; ctx.apiFailed = true;
+            if (item.pages && task.pagination.pageSize && sizeOf() && sizeOf() !== task.pagination.pageSize && task.config.startPage === 1) {
+              // 接口与页面每页条数不同，页码无法对应：页面点击从第 1 页重新采集（按评论 ID 去重）
+              item.nextPage = 1; item.cursor = ""; item.lastSig = prevSig = ""; item.pages = 0;
+            }
+            if (item.targetId) task.productPath = null; // 商品参数可能有误，由页面搜索重新学习
+            continue;
           }
-          if (task.config.driver === "api") throw error;
-          if (task.pageReloaded) throw kindError("fatal", `接口直连失败（${error.message}）。评价页已被刷新过、页面上的筛选已重置，为避免采集条件改变，不改用页面点击。请稍后点“继续”重试。`);
-          logEvent("warn", `接口直连不可用（${error.message}），切换为页面点击翻页。`);
-          task.stripSign = false; task.replayWorld = "";
-          mode = "ui"; ctx.positioned = false; ctx.apiFailed = true;
-          if (item.pages && task.pagination.pageSize && sizeOf() && sizeOf() !== task.pagination.pageSize && task.config.startPage === 1) {
-            // 接口与页面每页条数不同，页码无法对应：页面点击从第 1 页重新采集（按评论 ID 去重）
-            item.nextPage = 1; item.cursor = ""; item.lastSig = prevSig = ""; item.pages = 0;
-          }
-          if (item.targetId) task.productPath = null; // 商品参数可能有误，由页面搜索重新学习
-          continue;
         }
       } else {
         let attempt = 0;
@@ -472,12 +491,15 @@
       pagesThisRun++;
 
       // 结束判断
-      let end = !rows.length || payload.end || payload.hasMore === false || (task.config.endPage && page >= task.config.endPage);
+      const expectedPages = item.total != null && perPage ? Math.ceil(item.total / perPage) : 0;
+      let end = (!rows.length && !payload.skipped) || payload.end || (task.config.endPage && page >= task.config.endPage);
       if (mode === "api") {
-        end = end || (item.total != null && perPage && page * perPage >= item.total) ||
-          (sizeOf() && rows.length < sizeOf()) ||
+        // 已知总数时以总页数为准；不足一页不再视为最后一页
+        end = end || (expectedPages ? page >= expectedPages : ((payload.hasMore === false) || (sizeOf() && rows.length < sizeOf()))) ||
           (task.pagination.kind === "cursor" && !task.pagination.pagePath && !payload.nextCursor);
-      }
+      } else end = end || payload.hasMore === false;
+      if (payload.skipped && ctx.emptySkips >= 3) end = false;
+      if (rows.length) ctx.emptySkips = 0;
       if (end) break;
 
       // 页面搜索学到商品参数后，切回接口直连（除非接口刚失败过）

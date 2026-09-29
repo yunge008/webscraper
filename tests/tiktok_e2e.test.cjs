@@ -63,8 +63,13 @@ function render(data) {
   document.getElementById("list").textContent = data.list.map(r => r.main_review_id).join(",");
   const pages = Math.max(1, Math.ceil(data.total / state.size));
   const pager = document.getElementById("pager"); pager.innerHTML = "";
-  const lo = Math.max(1, state.page - 2), hi = Math.min(pages, state.page + 2);
-  for (let p = lo; p <= hi; p++) { const li = document.createElement("li"); li.className = "core-pagination-item" + (p === state.page ? " core-pagination-item-active" : ""); li.textContent = p; li.onclick = () => { state.page = p; load(); }; pager.appendChild(li); }
+  // 仿 Arco：1 … (当前±2) … 末页；省略号点击前进/后退 5 页；没有跳页输入框
+  const lo = Math.max(1, Math.min(state.page - 2, pages - 4)), hi = Math.min(pages, Math.max(state.page + 2, 5));
+  const add = (text, cls, go) => { const li = document.createElement("li"); li.className = "core-pagination-item " + cls; li.textContent = text; li.onclick = go; pager.appendChild(li); };
+  const num = p => add(p, p === state.page ? "core-pagination-item-active" : "", () => { state.page = p; load(); });
+  if (lo > 1) { num(1); if (lo > 2) add("•••", "core-pagination-item-jumper", () => { state.page = Math.max(1, state.page - 5); load(); }); }
+  for (let p = lo; p <= hi; p++) num(p);
+  if (hi < pages) { if (hi < pages - 1) add("•••", "core-pagination-item-jumper", () => { state.page = Math.min(pages, state.page + 5); load(); }); num(pages); }
   const next = document.createElement("li"); next.className = "core-pagination-item core-pagination-item-next" + (state.page >= pages ? " core-pagination-item-disabled" : ""); next.textContent = ">";
   next.onclick = () => { if (state.page < pages) { state.page++; load(); } }; pager.appendChild(next);
   const size = document.createElement("li"); size.innerHTML = '<span class="core-select-view-value">' + state.size + ' / Page</span>'; pager.appendChild(size);
@@ -96,7 +101,9 @@ async function handleApi(route) {
   }
   const page = Number(body.page) || 1;
   const all = filterReviews(body);
-  const list = all.slice((page - 1) * size, page * size);
+  let list = all.slice((page - 1) * size, page * size);
+  // 模拟 TikTok：中途某些页不足一页（隐藏的评论仍计入总数）
+  if (mode.shortPages && mode.shortPages.includes(page)) list = list.slice(2);
   const text = `{"code":0,"message":"success","data":{"list":[${list.map(reviewJson).join(",")}],"total":${all.length},"next_cursor":"${page}"}}`;
   globalThis.__apiCalls = (globalThis.__apiCalls || 0) + 1;
   return route.fulfill({ status: 200, contentType: "application/json", body: text });
@@ -302,6 +309,34 @@ test("e2e: current filter, product list, UI fallback, image & export", { timeout
       assert.equal(result.error, "", result.error);
       assert.ok(globalThis.__emptied, "server served the empty page");
       assert.equal(Number(result.rows), 130);
+    });
+
+    await t.test("short pages mid-list (hidden reviews) do not end the task or change the page size", async () => {
+      globalThis.__serverMode = { shortPages: [2, 4] };
+      await seller.fill("#kw", ""); await seller.fill("#startDay", ""); await seller.fill("#endDay", ""); await seller.click("#query"); await seller.waitForTimeout(500);
+      const all = REVIEWS.filter(r => r.product === P.A).map(r => r.id);
+      const expected = all.filter((_, i) => ![20, 21, 60, 61].includes(i));
+      await fillForm(panel, { mode: "ids", ids: P.A, pageSize: 20 });
+      let result = await runAndWait(panel);
+      assert.equal(result.error, "", result.error);
+      assert.deepEqual(sheetRows(await exportWorkbook(panel), "评论").map(r => r["评论 ID"]), expected);
+      // 从一个不足一页的页开始（断点续跑场景）：不能把条数改成 18
+      await fillForm(panel, { mode: "ids", ids: P.A, startPage: 4, pageSize: 20 });
+      result = await runAndWait(panel);
+      assert.equal(result.error, "", result.error);
+      assert.deepEqual(sheetRows(await exportWorkbook(panel), "评论").map(r => r["评论 ID"]), all.slice(62));
+    });
+
+    await t.test("page-click mode resumes at a page number that is not visible in the pager", async () => {
+      globalThis.__serverMode = {};
+      await seller.fill("#kw", ""); await seller.fill("#startDay", ""); await seller.fill("#endDay", ""); await seller.click("#query"); await seller.waitForTimeout(500);
+      await fillForm(panel, { mode: "current", startPage: 10, driver: "ui" });
+      const result = await runAndWait(panel, 180000);
+      assert.equal(result.error, "", result.error);
+      if (process.env.TK_DEBUG) fs.writeFileSync(process.env.TK_DEBUG + ".ui", (await panel.evaluate(() => window.TKReviewDiagnosticsAPI.report())).events.map(e => `${e.level} ${e.message}`).join("\n"));
+      assert.equal(result.driver, "页面点击");
+      const ids = sheetRows(await exportWorkbook(panel), "评论").map(r => r["评论 ID"]);
+      assert.deepEqual(ids, REVIEWS.slice(180).map(r => r.id));
     });
 
     await t.test("the seller page was never reloaded by the extension", async () => {
