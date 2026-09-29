@@ -33,8 +33,11 @@ const BASE_TS = 1727740800;
 const createTime = r => BASE_TS + r.day * 86400 + (Number(BigInt(r.id) % 80000n));
 function filterReviews(body) {
   const f = body.filter || {};
-  return REVIEWS.filter(r => (!body.search_key || r.product === body.search_key || r.sku === body.search_key) &&
+  const list = REVIEWS.filter(r => (!body.search_key || r.product === body.search_key || r.sku === body.search_key) &&
     (!f.review_time_start || createTime(r) >= f.review_time_start) && (!f.review_time_end || createTime(r) <= f.review_time_end));
+  // 模糊搜索：结果中夹杂一条其他商品的评论
+  if (body.search_key && (globalThis.__serverMode || {}).fuzzy && list.length > 30) list.splice(25, 0, REVIEWS.find(r => r.product === "1731892023085000001"));
+  return list;
 }
 function reviewJson(r) {
   const images = Array.from({ length: r.images }, (_, i) => ({ thumb_url_list: [`https://p16-img.example.com/tos/${r.id}-${i}~tplv-thumb.jpeg?x-expires=1`], url_list: [`https://p16-img.example.com/tos/${r.id}-${i}~tplv-origin.jpeg?x-expires=1`, `https://p19-img.example.com/tos/${r.id}-${i}~tplv-origin.jpeg`] }));
@@ -363,6 +366,20 @@ test("e2e: current filter, product list, UI fallback, image & export", { timeout
       const ids = sheetRows(await exportWorkbook(panel), "评论").map(r => r["评论 ID"]);
       assert.equal(new Set(ids).size, 12000);
       for (let i = REVIEWS.length - 1; i >= 0; i--) if (REVIEWS[i].product === WIDE) REVIEWS.splice(i, 1);
+    });
+
+    await t.test("fuzzy product search mixing in other products: extra rows are dropped, collection continues", async () => {
+      globalThis.__serverMode = { fuzzy: true };
+      await seller.fill("#kw", ""); await seller.fill("#startDay", ""); await seller.fill("#endDay", ""); await seller.click("#query"); await seller.waitForTimeout(500);
+      await fillForm(panel, { mode: "ids", ids: `${P.C}\n${P.A}`, pageSize: 20 });
+      const result = await runAndWait(panel);
+      assert.equal(result.error, "", result.error);
+      const book = await exportWorkbook(panel);
+      const rows = sheetRows(book, "评论");
+      assert.equal(rows.filter(r => r["采集商品 ID"] === P.A).length, 130);
+      assert.ok(rows.every(r => r["商品 ID"] === r["采集商品 ID"]));
+      const summary = sheetRows(book, "商品汇总");
+      assert.equal(Number(summary.find(r => r["采集商品 ID"] === P.A)["已排除（搜索结果中的其他商品）"]), 1);
     });
 
     await t.test("the seller page was never reloaded by the extension", async () => {

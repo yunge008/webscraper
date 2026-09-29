@@ -234,6 +234,20 @@
     throw lastError;
   }
 
+  // 商品搜索可能是模糊搜索（例如 fuzzy_param），结果里会夹杂少量其他商品的评论：
+  // 排除不属于目标 ID 的行继续采集；若一页中大多数都不属于该 ID，说明商品条件没生效，停止以免采成全店评论。
+  function keepTarget(item, payload, page, failKind) {
+    if (!item.targetId || !payload.list.length) return payload;
+    const kept = payload.list.filter(it => C.rowMatchesProduct(C.flattenReview(it), item.targetId));
+    const dropped = payload.list.length - kept.length;
+    if (!dropped) return payload;
+    if (kept.length * 2 < payload.list.length) throw kindError(failKind, `返回的评论大多不属于 ${item.targetId}（${dropped}/${payload.list.length} 条是其他商品），商品条件可能没有生效，已停止以免采成全店评论。`);
+    item.dropped = (item.dropped || 0) + dropped;
+    const others = [...new Set(payload.list.filter(it => !kept.includes(it)).map(it => C.flattenReview(it).product_id))].slice(0, 3).join(", ");
+    logEvent("warn", `商品 ${item.targetId} 第 ${page} 页：搜索结果含 ${dropped} 条其他商品的评论（${others}），已排除。`);
+    return { ...payload, list: kept, rawCount: payload.list.length };
+  }
+
   // ---------------- 页面点击 ----------------
   async function uiSearch(targetId) {
     const before = (await hook("status")).seq;
@@ -245,7 +259,7 @@
       const rows = payload.list.map(C.flattenReview);
       if (!targetId) return true;
       if (!rows.length) return payload.total === 0 ? true : "空列表但没有明确总数 0";
-      if (rows.every(row => C.rowMatchesProduct(row, targetId))) return true;
+      if (rows.filter(row => C.rowMatchesProduct(row, targetId)).length * 2 >= rows.length) return true;
       mismatch = "返回的评论不属于该 ID";
       return mismatch;
     }, 20000);
@@ -404,8 +418,8 @@
             }
             return p;
           });
+          payload = keepTarget(item, payload, page, "api");
           const rows = payload.list.map(C.flattenReview);
-          if (item.targetId && rows.some(row => !C.rowMatchesProduct(row, item.targetId))) throw kindError("api", "接口返回了其他商品的评论（商品参数未生效）");
           // TikTok 接口按页码最多只能翻到第 1 万条：超过后按时间分段采集
           const winSize = sizeOf() || item.maxRows || rows.length || 50;
           if (payload.total > WINDOW_LIMIT && task.timeRange) { item.total = payload.total; return runSegmented(task, item, itemIndex, ctx); }
@@ -467,9 +481,7 @@
             await pausableSleep(2000);
           }
         }
-        if (item.targetId && payload.list.map(C.flattenReview).some(row => !C.rowMatchesProduct(row, item.targetId))) {
-          throw kindError("item", `页面返回了其他商品的评论，已停止采集 ${item.targetId}，避免混入全店评论。`);
-        }
+        payload = keepTarget(item, payload, page, "item");
       }
 
       // 保存（评论与进度同一事务；失败则回滚内存中的进度）
@@ -477,7 +489,8 @@
       const backup = JSON.stringify({ item, rowCount: task.rowCount, imageCount: task.imageCount });
       if (payload.total !== null && payload.total !== undefined) item.total = payload.total;
       if (!item.firstPageSize && rows.length) item.firstPageSize = rows.length;
-      item.maxRows = Math.max(item.maxRows || 0, rows.length); item.pagesSeen = (item.pagesSeen || 0) + (rows.length ? 1 : 0);
+      const rawCount = payload.rawCount != null ? payload.rawCount : rows.length;
+      item.maxRows = Math.max(item.maxRows || 0, rawCount); item.pagesSeen = (item.pagesSeen || 0) + (rows.length ? 1 : 0);
       // 服务器若把每页条数限制得比请求小，以观察到的最大条数计算总页数（中途不足一页是正常的）
       const perPage = mode === "api" && sizeOf() ? (item.pagesSeen >= 2 && item.maxRows < sizeOf() ? item.maxRows : sizeOf()) : Math.max(item.firstPageSize || 0, rows.length);
       if (item.total && perPage) item.totalPages = Math.ceil(item.total / perPage);
@@ -502,7 +515,7 @@
       let end = (!rows.length && !payload.skipped) || payload.end || (task.config.endPage && page >= task.config.endPage);
       if (mode === "api") {
         // 已知总数时以总页数为准；不足一页不再视为最后一页
-        end = end || (expectedPages ? page >= expectedPages : ((payload.hasMore === false) || (sizeOf() && rows.length < sizeOf()))) ||
+        end = end || (expectedPages ? page >= expectedPages : ((payload.hasMore === false) || (sizeOf() && rawCount < sizeOf()))) ||
           (task.pagination.kind === "cursor" && !task.pagination.pagePath && !payload.nextCursor);
       } else end = end || payload.hasMore === false;
       if (payload.skipped && ctx.emptySkips >= 3) end = false;
@@ -569,10 +582,9 @@
     const fetchSeg = async (seg, page) => {
       while (true) {
         try {
-          const payload = await withRetry(() => apiFetchPage(task, item, page, { timeRange: { ...range, startMs: seg.startMs, endMs: seg.endMs } }));
+          const payload = keepTarget(item, await withRetry(() => apiFetchPage(task, item, page, { timeRange: { ...range, startMs: seg.startMs, endMs: seg.endMs } })), page, "fatal");
           ctx.reloaded = false;
           const rows = payload.list.map(C.flattenReview);
-          if (item.targetId && rows.some(row => !C.rowMatchesProduct(row, item.targetId))) throw kindError("fatal", `接口返回了其他商品的评论（商品 ${item.targetId}），已暂停，避免混入其他商品。`);
           return { payload, rows };
         } catch (error) {
           if (error.kind === "fatal" || error.kind === "paused") throw error;
@@ -785,10 +797,10 @@
     for (const r of records) (r.row.review_images || []).forEach((img, i) => images.push([r.targetId || "", r.row.main_review_id, r.row.product_id, i + 1, img.url, img.thumbnail || ""]));
     XLSX.utils.book_append_sheet(book, textSheet(images, [21, 21, 21, 8, 80, 80]), "评价图");
     if (task.mode === "ids") {
-      const summary = [["采集商品 ID", "状态", "接口总条数", "已采集条数", "已采集页数", "说明"]];
+      const summary = [["采集商品 ID", "状态", "接口总条数", "已采集条数", "已采集页数", "已排除（搜索结果中的其他商品）", "说明"]];
       const names = { done: "完成", empty: "无评论", error: "失败", pending: "未开始", running: "未完成" };
-      for (const item of task.items) summary.push([item.targetId, names[item.status] || item.status, item.total == null ? "" : item.total, item.rows || 0, item.pages || 0, item.error || ""]);
-      XLSX.utils.book_append_sheet(book, textSheet(summary, [21, 8, 10, 10, 10, 60]), "商品汇总");
+      for (const item of task.items) summary.push([item.targetId, names[item.status] || item.status, item.total == null ? "" : item.total, item.rows || 0, item.pages || 0, item.dropped || 0, item.error || ""]);
+      XLSX.utils.book_append_sheet(book, textSheet(summary, [21, 8, 10, 10, 10, 14, 60]), "商品汇总");
     }
     // Judge.me 导入：列顺序按 Judge.me CSV 模板；product_handle 需填 Shopify 商品 handle（第一列辅助列导入前删除）
     const judge = [["TikTok商品ID（导入前删除此列）", "title", "body", "rating", "review_date", "source", "curated", "reviewer_name", "reviewer_email", "product_id", "product_handle", "reply", "reply_date", "picture_urls", "ip_address", "location"]];
