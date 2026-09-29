@@ -131,7 +131,7 @@ async function setup() {
     if (url.pathname.startsWith("/product/rating")) return route.fulfill({ status: 200, contentType: "text/html", body: PAGE_HTML });
     return route.fulfill({ status: 404, body: "" });
   });
-  await context.route("https://p16-img.example.com/**", route => route.fulfill({ status: 200, contentType: "image/jpeg", body: Buffer.from([0xff, 0xd8, 0xff, 0xd9]) }));
+  await context.route("https://p16-img.example.com/**", route => route.fulfill({ status: 200, contentType: "image/png", body: Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==", "base64") }));
   let [worker] = context.serviceWorkers();
   if (!worker) worker = await context.waitForEvent("serviceworker");
   const extensionId = new URL(worker.url()).host;
@@ -398,16 +398,35 @@ test("e2e: current filter, product list, UI fallback, image & export", { timeout
       assert.ok(seller.__loads - loadsBefore >= 2, `page reloaded ${seller.__loads - loadsBefore} times`);
     });
 
-    await t.test("download review images to disk", async () => {
+    await t.test("review images: one ZIP archive, and Excel with embedded thumbnails", async () => {
       globalThis.__serverMode = {};
       await seller.fill("#startDay", ""); await seller.fill("#endDay", ""); await seller.click("#query"); await seller.waitForTimeout(500);
       await fillForm(panel, { mode: "ids", ids: P.C, pageSize: 50 });
       await runAndWait(panel);
-      const expected = REVIEWS.filter(r => r.product === P.C && r.images).length * 2;
-      await panel.click("#downloadImages");
-      await panel.waitForFunction(() => /下载已提交/.test(document.getElementById("status").textContent), null, { timeout: 60000 });
-      if (process.env.TK_DEBUG) fs.writeFileSync(process.env.TK_DEBUG + ".img", (await panel.evaluate(() => window.TKReviewDiagnosticsAPI.report())).events.map(e => `${e.level} ${e.message}`).join("\n"));
-      assert.match(await panel.textContent("#status"), new RegExp(`${expected} 张`));
+      const withImages = REVIEWS.filter(r => r.product === P.C && r.images);
+      const expected = withImages.length * 2;
+      // ZIP：一个压缩包，按商品 ID 分文件夹
+      const [zipDl] = await Promise.all([panel.waitForEvent("download"), panel.click("#downloadImages")]);
+      assert.match(zipDl.suggestedFilename(), /\.zip$/);
+      await panel.waitForFunction(() => /已打包/.test(document.getElementById("status").textContent), null, { timeout: 60000 });
+      const Media = require("../webscraper-rebuilt/tiktok_media.js");
+      const zipFiles = await Media.readZip(fs.readFileSync(await zipDl.path()));
+      assert.equal(zipFiles.length, expected);
+      assert.ok(zipFiles.every(f => f.name.startsWith(`${P.C}/`) && /_\d\.(png|jpg)$/.test(f.name)), zipFiles.slice(0, 3).map(f => f.name).join(","));
+      // Excel 含图片预览：缩略图嵌入评论表，可被 SheetJS 正常读取
+      const [xlsxDl] = await Promise.all([panel.waitForEvent("download", { timeout: 120000 }), panel.click("#exportXlsxImages")]);
+      const bytes = fs.readFileSync(await xlsxDl.path());
+      const book = XLSX.read(bytes, { type: "buffer" });
+      const rows = sheetRows(book, "评论");
+      assert.equal(rows.length, 45);
+      assert.ok(Object.keys(rows[0]).includes("评价图预览1"));
+      const parts = await Media.readZip(bytes);
+      const drawing = parts.find(f => f.name === "xl/drawings/drawing1.xml");
+      assert.ok(drawing, "drawing part present");
+      assert.equal((new TextDecoder().decode(drawing.data).match(/<xdr:pic>/g) || []).length, expected);
+      assert.equal(parts.filter(f => f.name.startsWith("xl/media/")).length, expected);
+      assert.match(new TextDecoder().decode(parts.find(f => f.name === "xl/worksheets/sheet1.xml").data), /<drawing r:id="rIdTkDrawing"\/>/);
+      assert.match(await panel.textContent("#status"), new RegExp(`嵌入 ${expected} 张缩略图`));
     });
     await t.test("side panel shell: tabs and diagnostics copy/probe", async () => {
       const shell = await context.newPage();

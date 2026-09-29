@@ -72,7 +72,8 @@
 			<p id="taskInfo" class="tk-muted"></p>
 			<div class="tk-actions">
 				<button id="exportXlsx" type="button" disabled>导出 Excel</button>
-				<button id="downloadImages" type="button" disabled>下载评价图</button>
+				<button id="exportXlsxImages" type="button" disabled title="评论表中嵌入评价图缩略图（每条最多 3 张），点击打开原图；需逐张获取图片，数量多时需几分钟">导出 Excel（含图片预览）</button>
+				<button id="downloadImages" type="button" disabled>下载评价图（ZIP）</button>
 				<button id="deleteTask" type="button" disabled>删除任务</button>
 			</div>
 		</section>
@@ -90,6 +91,7 @@
 	<script src="sheetjs-0.20.3.min.js"></script>
 	<script src="tiktok_core.js"></script>
 	<script src="tiktok_store.js"></script>
+	<script src="tiktok_media.js"></script>
 	<script src="tiktok_product_import.js"></script>
 	<script src="tiktok_reviews.js"></script>
 </body>

@@ -10,7 +10,7 @@
   const store = new window.TKStore();
   const $ = id => document.getElementById(id);
   const els = {};
-  for (const id of ["version", "pageStatus", "errorBanner", "idsBox", "productIds", "idFile", "idCount", "startPage", "endPage", "pageSize", "batchSize", "delayMs", "driver", "reloadEachBatch", "createTask", "pauseTask", "resumeTask", "statTotal", "statRows", "statImages", "statDriver", "progress", "status", "taskSelect", "taskInfo", "exportXlsx", "downloadImages", "deleteTask", "rowCount", "previewHead", "previewBody"]) els[id] = $(id);
+  for (const id of ["version", "pageStatus", "errorBanner", "idsBox", "productIds", "idFile", "idCount", "startPage", "endPage", "pageSize", "batchSize", "delayMs", "driver", "reloadEachBatch", "createTask", "pauseTask", "resumeTask", "statTotal", "statRows", "statImages", "statDriver", "progress", "status", "taskSelect", "taskInfo", "exportXlsx", "exportXlsxImages", "downloadImages", "deleteTask", "rowCount", "previewHead", "previewBody"]) els[id] = $(id);
   const VERSION = chrome.runtime.getManifest().version;
   const FORM_KEY = "tkReviewForm";
   const PREVIEW_COLUMNS = C.OUTPUT_COLUMNS.filter(([key]) => key !== "review_image_urls");
@@ -785,14 +785,31 @@
     if (widths) sheet["!cols"] = widths.map(w => ({ wch: w }));
     return sheet;
   }
-  async function exportXlsx(task) {
+  const PREVIEW_PER_ROW = 3;
+  const THUMB_PX = 80;
+  async function exportXlsx(task, options = {}) {
     const XLSX = window.XLSX;
     if (!XLSX) throw new Error("Excel 组件未加载。");
     setStatus("正在生成 Excel…");
     const records = (await store.readRows(task.id)).sort((a, b) => a.order - b.order);
     const book = XLSX.utils.book_new();
     const widths = { target_id: 21, star_level: 6, review_text: 50, reply_text: 30, reply_count: 6, main_review_id: 21, order_id: 21, product_id: 21, product_name: 30, sku_id: 21, sku_specification: 20, user_name: 14, create_time: 19, review_image_count: 8, review_image_urls: 60, page: 6 };
-    XLSX.utils.book_append_sheet(book, textSheet(C.exportAoa(records), C.OUTPUT_COLUMNS.map(([k]) => widths[k] || 12)), "评论");
+    const reviewAoa = C.exportAoa(records);
+    const colWidths = C.OUTPUT_COLUMNS.map(([k]) => widths[k] || 12);
+    let thumbs = [];
+    if (options.withImages) {
+      // 评论表末尾加“评价图预览”列，缩略图嵌入单元格位置，点击打开原图
+      const previewCol = reviewAoa[0].length;
+      for (let i = 1; i <= PREVIEW_PER_ROW; i++) { reviewAoa[0].push(`评价图预览${i}`); colWidths.push(Math.round(THUMB_PX / 7) + 2); }
+      thumbs = await buildThumbnails(records, previewCol);
+      if (pauseRequested) throw kindError("paused", "已取消导出。");
+    }
+    const reviewSheet = textSheet(reviewAoa, colWidths);
+    if (options.withImages) {
+      const rowsWithImages = new Set(thumbs.map(t => t.row));
+      reviewSheet["!rows"] = reviewAoa.map((_, r) => (rowsWithImages.has(r) ? { hpx: THUMB_PX + 6 } : null));
+    }
+    XLSX.utils.book_append_sheet(book, reviewSheet, "评论");
     const images = [["采集商品 ID", "评论 ID", "商品 ID", "图片序号", "图片链接", "缩略图链接"]];
     for (const r of records) (r.row.review_images || []).forEach((img, i) => images.push([r.targetId || "", r.row.main_review_id, r.row.product_id, i + 1, img.url, img.thumbnail || ""]));
     XLSX.utils.book_append_sheet(book, textSheet(images, [21, 21, 21, 8, 80, 80]), "评价图");
@@ -819,34 +836,74 @@
     const info = [["项目", "值"], ["评价图链接最早过期时间", expiryText], ["任务", task.name], ["创建时间", new Date(task.createdAt).toLocaleString()], ["状态", task.status], ["评论条数", records.length], ["评价图数量", images.length - 1], ["页码范围", `${task.config.startPage} - ${task.config.endPage || "全部"}`], ["翻页方式", task.driverUsed === "api" ? "接口直连" : "页面点击"], ["接口", task.template ? endpointOf(task.template.url) : ""], ["错误", task.lastError || ""]];
     XLSX.utils.book_append_sheet(book, textSheet(info, [12, 60]), "任务信息");
     const out = XLSX.write(book, { bookType: "xlsx", type: "array", compression: true });
-    download(new Blob([out], { type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" }), `TK评论_${safeName(task.name)}_${stamp(task.createdAt)}.xlsx`);
-    setStatus(`已导出 ${records.length} 条评论、${images.length - 1} 张评价图链接。${expiry ? `图片链接最早 ${expiryText} 过期，导入 Judge.me 等平台请在此之前完成。` : ""}`);
+    let blob = new Blob([out], { type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" });
+    if (options.withImages && thumbs.length) {
+      setStatus(`正在把 ${thumbs.length} 张缩略图写入 Excel…`);
+      blob = new Blob([await window.TKMedia.embedImages(new Uint8Array(out), thumbs)], { type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" });
+    }
+    download(blob, `TK评论_${safeName(task.name)}_${stamp(task.createdAt)}${options.withImages ? "_含图片" : ""}.xlsx`);
+    const failedThumbs = options.withImages ? thumbs.failed || 0 : 0;
+    setStatus(`已导出 ${records.length} 条评论、${images.length - 1} 张评价图链接${options.withImages ? `，嵌入 ${thumbs.length} 张缩略图${failedThumbs ? `（${failedThumbs} 张获取失败，可能链接已过期）` : ""}` : ""}。${expiry ? `图片链接最早 ${expiryText} 过期，导入 Judge.me 等平台请在此之前完成。` : ""}`);
   }
-  async function downloadImages(task) {
-    if (!chrome.downloads) throw new Error("浏览器未授予下载权限，请在扩展管理中重新加载扩展。");
-    const records = (await store.readRows(task.id)).sort((a, b) => a.order - b.order);
-    const ascii = text => String(text).replace(/[^A-Za-z0-9._-]+/g, "_").slice(0, 60) || "x";
-    const folder = `${task.mode === "current" ? "filtered" : task.items.length === 1 ? ascii(task.items[0].targetId) : `list-${task.items.length}`}_${stamp(task.createdAt)}`;
+  // 为每条评论前 PREVIEW_PER_ROW 张图生成缩略图
+  async function buildThumbnails(records, previewCol) {
     const jobs = [];
-    for (const r of records) (r.row.review_images || []).forEach((img, i) => {
-      const ext = (img.url.split("?")[0].match(/\.(jpe?g|png|webp|gif|heic|avif)$/i) || [, "jpg"])[1].toLowerCase();
-      // 下载目录只用 ASCII：部分系统上 chrome.downloads 会拒绝含中文的路径
-      jobs.push({ url: img.url, filename: `TK_review_images/${folder}/${ascii(r.targetId || r.row.product_id || "unknown")}/${ascii(r.row.main_review_id || r.key)}_${i + 1}.${ext}` });
-    });
+    records.forEach((r, i) => (r.row.review_images || []).slice(0, PREVIEW_PER_ROW).forEach((img, k) => jobs.push({ row: i + 1, col: previewCol + k, url: img.url, thumbnail: img.thumbnail })));
+    const thumbs = [];
+    let done = 0, failed = 0;
+    await window.TKMedia.pool(jobs, 6, async job => {
+      try {
+        let got;
+        try { got = await window.TKMedia.fetchBytes(job.thumbnail || job.url); } catch (_) { got = await window.TKMedia.fetchBytes(job.url); }
+        const t = await window.TKMedia.thumbnail(got.bytes, THUMB_PX);
+        thumbs.push({ row: job.row, col: job.col, bytes: t.bytes, w: t.w, h: t.h, link: job.url });
+      } catch (error) { failed++; if (failed <= 5) logEvent("warn", `缩略图获取失败：${error.message}`); }
+      done++;
+      if (done % 20 === 0 || done === jobs.length) setStatus(`正在生成缩略图：${done} / ${jobs.length}${failed ? `（失败 ${failed}）` : ""}…（点“暂停”可取消）`);
+    }, () => pauseRequested);
+    thumbs.sort((a, b) => a.row - b.row || a.col - b.col);
+    thumbs.failed = failed;
+    return thumbs;
+  }
+  // 评价图打包为 ZIP（按商品 ID 分文件夹，以“评论ID_序号”命名）；超过约 300MB 或 3000 张自动分卷
+  async function downloadImages(task) {
+    const records = (await store.readRows(task.id)).sort((a, b) => a.order - b.order);
+    const jobs = [];
+    for (const r of records) (r.row.review_images || []).forEach((img, i) => jobs.push({ url: img.url, dir: safeName(r.targetId || r.row.product_id || "未知商品"), base: `${safeName(r.row.main_review_id || r.key)}_${i + 1}` }));
     if (!jobs.length) throw new Error("该任务没有评价图。");
     busy = true; pauseRequested = false; controls();
-    let done = 0, failed = 0;
+    const PART_BYTES = 300 * 1024 * 1024, PART_FILES = 3000;
+    let part = [], partBytes = 0, partNo = 0, done = 0, failed = 0, saved = 0;
+    const failures = [];
+    const name = `TK评价图_${safeName(task.name)}_${stamp(task.createdAt)}`;
+    const flush = () => {
+      if (!part.length) return;
+      partNo++;
+      download(window.TKMedia.writeZip(part), `${name}_第${partNo}部分.zip`);
+      saved += part.filter(f => !f.list).length; part = []; partBytes = 0;
+    };
     try {
-      const worker = async () => {
-        while (jobs.length && !pauseRequested) {
-          const job = jobs.shift();
-          try { await chrome.downloads.download({ url: job.url, filename: job.filename, conflictAction: "uniquify", saveAs: false }); done++; }
-          catch (error) { failed++; logEvent("warn", `图片下载失败：${error.message}（${job.filename}）`); }
-          setStatus(`正在下载评价图：${done} 成功 / ${failed} 失败，剩余 ${jobs.length}…`);
+      // 按顺序分块抓取，保证分卷内容稳定
+      for (let start = 0; start < jobs.length && !pauseRequested; start += 60) {
+        const chunk = jobs.slice(start, start + 60);
+        const results = new Array(chunk.length);
+        await window.TKMedia.pool(chunk, 6, async (job, i) => {
+          try {
+            const got = await window.TKMedia.fetchBytes(job.url);
+            results[i] = { name: `${job.dir}/${job.base}.${window.TKMedia.extOf(job.url, got.type)}`, data: got.bytes };
+          } catch (error) { failed++; failures.push(`${job.dir}/${job.base}\t${error.message}\t${job.url}`); }
+          done++;
+        }, () => pauseRequested);
+        for (const file of results) {
+          if (!file) continue;
+          if (part.length && (partBytes + file.data.length > PART_BYTES || part.length >= PART_FILES)) flush();
+          part.push(file); partBytes += file.data.length;
         }
-      };
-      await Promise.all([worker(), worker(), worker()]);
-      setStatus(`评价图下载已提交：${done} 张${failed ? `，${failed} 张失败（链接可能已过期，可重新采集后再下载）` : ""}。文件在浏览器下载目录的 TK_review_images/${folder} 文件夹，按商品 ID 分目录、以“评论ID_序号”命名。`);
+        setStatus(`正在打包评价图：${done} / ${jobs.length}，失败 ${failed}${partNo ? `，已下载 ${partNo} 个压缩包` : ""}…（点“暂停”可停止，已打包的仍会下载）`);
+      }
+      if (failures.length) part.push({ name: "下载失败清单.txt", list: true, data: new TextEncoder().encode("文件\t原因\t链接\n" + failures.join("\n")) });
+      flush();
+      setStatus(`评价图已打包：${saved} 张，共 ${partNo} 个 ZIP 压缩包${failed ? `；${failed} 张获取失败（链接可能已过期，清单见压缩包内“下载失败清单.txt”，可重新采集后再下载）` : ""}${pauseRequested ? "（已手动停止）" : ""}。`);
     } finally { busy = false; pauseRequested = false; controls(); }
   }
 
@@ -873,6 +930,7 @@
     els.resumeTask.disabled = busy || !task || (task.status === "done" && !hasRemaining(task));
     els.exportXlsx.disabled = busy && !running ? true : !task;
     els.downloadImages.disabled = busy || !task || !task.imageCount;
+    els.exportXlsxImages.disabled = busy || !task || !task.imageCount;
     els.deleteTask.disabled = busy || !task;
     els.taskSelect.disabled = busy;
     for (const el of document.querySelectorAll("input[name=mode], #productIds, #idFile, #startPage, #endPage, #pageSize, #batchSize, #delayMs, #driver, #reloadEachBatch")) el.disabled = busy;
@@ -966,6 +1024,14 @@
     try { const task = running && running.id === selectedId ? running : await store.getTask(selectedId); if (!task) throw new Error("请先选择任务。"); await exportXlsx(task); }
     catch (error) { showError(error); }
   });
+  els.exportXlsxImages.addEventListener("click", action(async () => {
+    const task = await store.getTask(selectedId);
+    if (!task) throw new Error("请先选择任务。");
+    busy = true; pauseRequested = false; controls();
+    try { await exportXlsx(task, { withImages: true }); }
+    catch (error) { if (error.kind === "paused") setStatus("已取消导出。"); else throw error; }
+    finally { busy = false; pauseRequested = false; controls(); }
+  }));
   els.downloadImages.addEventListener("click", action(async () => { const task = await store.getTask(selectedId); if (!task) throw new Error("请先选择任务。"); await downloadImages(task); }));
   els.deleteTask.addEventListener("click", action(async () => {
     if (!selectedId || !confirm("删除该任务及其已采集数据？")) return;
