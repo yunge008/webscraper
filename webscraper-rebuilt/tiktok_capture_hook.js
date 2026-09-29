@@ -10,8 +10,15 @@
     seq: 0,
     records: [],   // 评论接口：完整请求 + 响应
     network: [],   // 与 review/rating 有关的请求元数据（诊断用）
-    errors: []
+    errors: [],
+    replayBodies: new Map() // 扩展重放请求的请求体 → 次数；页面 SDK 可能重建 fetch 参数，丢失 __tkReplay 标记
   };
+  function takeReplayMark(body) {
+    const n = body != null && state.replayBodies.get(body);
+    if (!n) return false;
+    if (n > 1) state.replayBodies.set(body, n - 1); else state.replayBodies.delete(body);
+    return true;
+  }
 
   function push(list, item, limit) { list.push(item); while (list.length > limit) list.shift(); }
   function absUrl(url) { try { return new URL(String(url), location.href).href; } catch (_) { return String(url || ""); } }
@@ -58,9 +65,10 @@
         const headers = new Headers((init && init.headers) || (input && input.headers) || undefined);
         headers.forEach((value, name) => { meta.headers[name] = value; });
         meta.body = init && init.body !== undefined ? bodyText(init.body) : null;
+        if (!meta.replay && takeReplayMark(meta.body)) meta.replay = true;
       } catch (_) {}
       const bodyPromise = meta.body == null && input instanceof Request && !/^(GET|HEAD)$/.test(meta.method)
-        ? input.clone().text().then(text => { meta.body = text; }, () => {}) : Promise.resolve();
+        ? input.clone().text().then(text => { meta.body = text; if (!meta.replay && takeReplayMark(text)) meta.replay = true; }, () => {}) : Promise.resolve();
       const promise = nativeFetch.apply(this, arguments);
       promise.then(response => {
         try {
@@ -88,6 +96,7 @@
     const meta = this[META];
     if (meta) {
       meta.seq = ++state.seq; meta.activePage = activePage(); meta.body = bodyText(body);
+      if (!meta.replay && takeReplayMark(meta.body)) meta.replay = true;
       this.addEventListener("loadend", () => {
         let text = "";
         try { text = this.responseType === "" || this.responseType === "text" ? this.responseText : this.responseType === "json" ? JSON.stringify(this.response) : ""; } catch (_) {}
@@ -100,6 +109,7 @@
   // ---- 重放：通过页面自身的 XHR / fetch 发送（页面安全 SDK 如有包装会自动签名） ----
   function replay(spec) {
     const timeout = spec.timeout || 30000;
+    if (spec.body != null) { state.replayBodies.set(spec.body, (state.replayBodies.get(spec.body) || 0) + 1); setTimeout(() => takeReplayMark(spec.body), timeout + 5000); }
     if (spec.transport === "fetch") {
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), timeout);

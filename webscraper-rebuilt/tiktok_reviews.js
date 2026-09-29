@@ -166,12 +166,14 @@
     const cursorValue = cursorLeaf ? String(cursorLeaf.value).replace(/^__TKBIG__/, "") : "";
     task.firstCursor = templateIsFirst ? cursorValue : (/^\d+$/.test(cursorValue) ? "0" : "");
     task.sizeUsed = task.pagination.sizePath ? (task.config.pageSize || task.pagination.pageSize) : 0;
+    task.timeRange = C.findTimeRange(template);
   }
-  async function apiFetchPage(task, item, page) {
+  async function apiFetchPage(task, item, page, extra = {}) {
     const spec = C.buildRequest(task.template, task.pagination, {
       page, pageSize: task.pagination.sizePath ? (item.sizeOverride || task.sizeUsed) : 0,
       cursor: task.pagination.cursorPath ? (page === 1 ? task.firstCursor : item.cursor || "") : undefined,
-      productId: item.targetId, productPath: item.targetId ? task.productPath : null, stripSign: !!task.stripSign
+      productId: item.targetId, productPath: item.targetId ? task.productPath : null, stripSign: !!task.stripSign,
+      timeRange: extra.timeRange
     });
     sentReplays.add(replayKey(spec.url, spec.body));
     if (sentReplays.size > 500) sentReplays.delete(sentReplays.values().next().value);
@@ -350,7 +352,9 @@
     const item = task.items[Math.min(task.index || 0, task.items.length - 1)];
     els.statTotal.textContent = item && item.total != null ? String(item.total) : "-";
     const doneItems = task.items.filter(i => i.status === "done" || i.status === "empty").length;
-    if (task.items.length > 1) {
+    if (item && item.segments && task.items.length === 1) {
+      els.progress.max = Math.max(1, item.total || 1); els.progress.value = Math.min(task.rowCount || 0, item.total || 0);
+    } else if (task.items.length > 1) {
       els.progress.max = task.items.length; els.progress.value = doneItems;
     } else if (item) {
       const totalPages = task.config.endPage ? Math.min(task.config.endPage, item.totalPages || task.config.endPage) : item.totalPages;
@@ -368,6 +372,7 @@
     const ctx = { positioned: false, apiOk: 0, apiFailed: false, variant: 0, reloaded: false };
     const sizeOf = () => item.sizeOverride || task.sizeUsed;
     let mode = decideDriver(task, item);
+    if (mode === "api" && item.segments) return runSegmented(task, item, itemIndex, ctx);
     let prevSig = item.lastSig || "";
     let pagesThisRun = 0;
     item.status = "running";
@@ -401,16 +406,15 @@
           });
           const rows = payload.list.map(C.flattenReview);
           if (item.targetId && rows.some(row => !C.rowMatchesProduct(row, item.targetId))) throw kindError("api", "接口返回了其他商品的评论（商品参数未生效）");
+          // TikTok 接口按页码最多只能翻到第 1 万条：超过后按时间分段采集
+          const winSize = sizeOf() || item.maxRows || rows.length || 50;
+          if (payload.total > WINDOW_LIMIT && task.timeRange) { item.total = payload.total; return runSegmented(task, item, itemIndex, ctx); }
+          if (payload.total > WINDOW_LIMIT && ((page - 1) * winSize >= WINDOW_LIMIT || (rows.length && C.payloadSignature(rows) === prevSig && page * winSize > WINDOW_LIMIT - 3 * winSize))) {
+            throw kindError("fatal", WINDOW_HELP(page - 1));
+          }
           if (rows.length && C.payloadSignature(rows) === prevSig) throw kindError("api", "接口翻页参数未生效（与上一页相同）");
           if (!rows.length && page === 1 && payload.total !== 0 && payload.total !== null) throw kindError("api", "接口第 1 页为空但总数不为 0");
-          // 服务器可能限制每页条数：以实际返回为准，避免误判为最后一页
-          // 只有请求条数大于页面自身每页条数、且返回条数不少于页面条数时，才判定为服务器上限（避免把正常的不足一页误判）
-          const pageOwn = task.pagination.pageSize || 0;
-          if (ctx.apiOk === 0 && sizeOf() && pageOwn && sizeOf() > pageOwn && rows.length < sizeOf() && rows.length >= pageOwn && payload.total && payload.total > (page - 1) * sizeOf() + rows.length) {
-            logEvent("warn", `接口每页实际返回 ${rows.length} 条（请求 ${sizeOf()} 条），按 ${rows.length} 条继续。`);
-            if (item.sizeOverride) item.sizeOverride = rows.length; else task.sizeUsed = rows.length;
-            if (page > 1) { continue; } // 页码含义随条数变化，重新请求本页
-          }
+          if (ctx.apiOk === 0) rememberReplayMode(task);
           ctx.apiOk++; ctx.reloaded = false;
         } catch (error) {
           if (error.kind === "fatal" || error.kind === "paused") throw error;
@@ -452,6 +456,7 @@
           }
         }
       } else {
+        if (item.total > WINDOW_LIMIT && (page - 1) * (item.maxRows || 50) >= WINDOW_LIMIT) throw kindError("fatal", WINDOW_HELP(page - 1));
         let attempt = 0;
         while (true) {
           try { payload = await uiReadPage(task, item, page, prevSig, ctx); break; }
@@ -472,7 +477,9 @@
       const backup = JSON.stringify({ item, rowCount: task.rowCount, imageCount: task.imageCount });
       if (payload.total !== null && payload.total !== undefined) item.total = payload.total;
       if (!item.firstPageSize && rows.length) item.firstPageSize = rows.length;
-      const perPage = mode === "api" && sizeOf() ? sizeOf() : Math.max(item.firstPageSize || 0, rows.length);
+      item.maxRows = Math.max(item.maxRows || 0, rows.length); item.pagesSeen = (item.pagesSeen || 0) + (rows.length ? 1 : 0);
+      // 服务器若把每页条数限制得比请求小，以观察到的最大条数计算总页数（中途不足一页是正常的）
+      const perPage = mode === "api" && sizeOf() ? (item.pagesSeen >= 2 && item.maxRows < sizeOf() ? item.maxRows : sizeOf()) : Math.max(item.firstPageSize || 0, rows.length);
       if (item.total && perPage) item.totalPages = Math.ceil(item.total / perPage);
       item.nextPage = page + 1;
       item.cursor = payload.nextCursor || "";
@@ -527,6 +534,111 @@
     }
     item.status = item.rows || item.pages ? "done" : "empty";
     item.error = "";
+  }
+
+  const WINDOW_LIMIT = 10000;
+  const WINDOW_HELP = saved => `TikTok 评论接口按页码最多只能翻到第 1 万条（已保存到约第 ${saved} 页）。要采集全部，请在评价页上选择“评价时间/日期范围”（例如从开店日期到今天）并点查询，然后新建任务：扩展会自动按时间分段，每段不超过 1 万条。`;
+  async function rememberReplayMode(task) {
+    try { await chrome.storage.local.set({ [`tkReplayMode:${endpointOf(task.template.url)}`]: { world: task.replayWorld || "ISOLATED", strip: !!task.stripSign } }); } catch (_) {}
+  }
+  function fmtDay(ms) { const d = new Date(ms); const p2 = n => String(n).padStart(2, "0"); return `${d.getFullYear()}-${p2(d.getMonth() + 1)}-${p2(d.getDate())}${d.getHours() || d.getMinutes() ? ` ${p2(d.getHours())}:${p2(d.getMinutes())}` : ""}`; }
+  function splitRange(seg, info) {
+    const step = info.unit === "date" ? 86400000 : info.unit === "ms" ? 1 : info.unit === "datetime" && info.seconds === false ? 60000 : 1000;
+    const minSpan = info.unit === "date" ? 86400000 : 3600000;
+    if (seg.endMs - seg.startMs < minSpan) return null;
+    let mid = Math.floor((seg.startMs + seg.endMs) / 2);
+    if (info.unit === "date") { const d = new Date(mid); mid = new Date(d.getFullYear(), d.getMonth(), d.getDate()).getTime(); if (mid < seg.startMs) mid = seg.startMs; }
+    if (mid + step > seg.endMs) return null;
+    // 较新的时间段排在前面（接口默认按时间倒序）
+    return [{ startMs: mid + step, endMs: seg.endMs, status: "pending" }, { startMs: seg.startMs, endMs: mid, status: "pending" }];
+  }
+  // 按时间分段采集：每段先取第 1 页看总数，超过 1 万条就对半拆分，直到每段都能完整翻页。
+  async function runSegmented(task, item, itemIndex, ctx) {
+    const range = task.timeRange;
+    if (!item.segments) {
+      item.segments = [{ startMs: range.startMs, endMs: range.endMs, status: "pending" }];
+      item.nextPage = task.config.startPage;
+      logEvent("info", `总数 ${item.total} 条超过接口 1 万条翻页上限，改为按时间分段采集（${fmtDay(range.startMs)} ~ ${fmtDay(range.endMs)}，字段 ${range.keys}）。`);
+      await store.putTask(task);
+    }
+    const size = task.sizeUsed || task.pagination.pageSize || 50;
+    const limit = WINDOW_LIMIT - 2 * size;
+    const label = item.targetId ? `商品 ${item.targetId}` : "当前筛选";
+    item.rowSeq = item.rowSeq || 0;
+    let pagesThisRun = 0;
+    const fetchSeg = async (seg, page) => {
+      while (true) {
+        try {
+          const payload = await withRetry(() => apiFetchPage(task, item, page, { timeRange: { ...range, startMs: seg.startMs, endMs: seg.endMs } }));
+          ctx.reloaded = false;
+          const rows = payload.list.map(C.flattenReview);
+          if (item.targetId && rows.some(row => !C.rowMatchesProduct(row, item.targetId))) throw kindError("fatal", `接口返回了其他商品的评论（商品 ${item.targetId}），已暂停，避免混入其他商品。`);
+          return { payload, rows };
+        } catch (error) {
+          if (error.kind === "fatal" || error.kind === "paused") throw error;
+          if (!ctx.reloaded) { ctx.reloaded = true; await reloadTab(`时间段请求异常（${error.message}）`); continue; }
+          throw kindError("fatal", `时间段 ${fmtDay(seg.startMs)} ~ ${fmtDay(seg.endMs)} 第 ${page} 页多次重试仍失败：${error.message}。已保存的数据保留，点“继续”接着采集。`);
+        }
+      }
+    };
+    while (true) {
+      if (pauseRequested) throw kindError("paused", "已暂停");
+      const segIndex = item.segments.findIndex(x => x.status !== "done");
+      if (segIndex < 0) break;
+      const seg = item.segments[segIndex];
+      const doneSegs = item.segments.filter(x => x.status === "done").length;
+      const segLabel = `${label}｜时间段 ${doneSegs + 1}/${item.segments.length}（${fmtDay(seg.startMs)} ~ ${fmtDay(seg.endMs)}）`;
+      if (seg.total == null) {
+        setStatus(`${segLabel}：检查该时间段条数…`);
+        const { payload, rows } = await fetchSeg(seg, 1);
+        const total = payload.total == null ? rows.length : payload.total;
+        if (total > limit) {
+          const halves = splitRange(seg, range.info);
+          if (halves) {
+            item.segments.splice(segIndex, 1, ...halves);
+            await store.putTask(task);
+            await pausableSleep(task.config.delayMs);
+            continue;
+          }
+          logEvent("warn", `时间段 ${fmtDay(seg.startMs)} ~ ${fmtDay(seg.endMs)} 有 ${total} 条且无法再拆分，只能采集前 1 万条。`);
+        }
+        seg.total = total; seg.pages = Math.ceil(Math.min(total, WINDOW_LIMIT) / size); seg.nextPage = 1; seg.lastSig = "";
+        if (!rows.length) { seg.status = "done"; await store.putTask(task); continue; }
+        await saveSegPage(task, item, itemIndex, seg, 1, rows);
+        pagesThisRun++;
+      }
+      while (seg.status !== "done") {
+        if (pauseRequested) throw kindError("paused", "已暂停");
+        const page = seg.nextPage;
+        if (page > seg.pages || page * size > WINDOW_LIMIT + size) { seg.status = "done"; await store.putTask(task); break; }
+        setStatus(`${segLabel}：第 ${page} / ${seg.pages} 页，共已采集 ${task.rowCount || 0} 条…`);
+        const { rows } = await fetchSeg(seg, page);
+        const sig = rows.length ? C.payloadSignature(rows) : "";
+        if (!rows.length || sig === seg.lastSig) { seg.status = "done"; await store.putTask(task); break; }
+        await saveSegPage(task, item, itemIndex, seg, page, rows);
+        pagesThisRun++;
+        if (pagesThisRun % task.config.batchSize === 0) {
+          setStatus(`${segLabel}：本轮第 ${pagesThisRun / task.config.batchSize} 批已采完，已保存 ${task.rowCount || 0} 条，稍候继续…`);
+          await pausableSleep(3000);
+          if (task.config.reloadEachBatch !== false && !pauseRequested) await reloadTab(`第 ${pagesThisRun / task.config.batchSize} 批结束`);
+        } else await pausableSleep(task.config.delayMs);
+      }
+    }
+    item.status = item.rows || item.pages ? "done" : "empty";
+    item.error = "";
+  }
+  async function saveSegPage(task, item, itemIndex, seg, page, rows) {
+    const backup = JSON.stringify({ item, rowCount: task.rowCount, imageCount: task.imageCount });
+    const records = rows.map(row => ({ key: C.rowKey(row), targetId: item.targetId, page, order: itemIndex * 1e9 + (++item.rowSeq), row }));
+    seg.nextPage = page + 1; seg.lastSig = C.payloadSignature(rows);
+    item.pages = (item.pages || 0) + 1;
+    try { item.rows = (item.rows || 0) + await store.savePage(task, records); }
+    catch (error) {
+      const saved = JSON.parse(backup); Object.assign(item, saved.item); task.rowCount = saved.rowCount; task.imageCount = saved.imageCount;
+      throw kindError("fatal", `本地保存失败：${error.message}`);
+    }
+    pushPreview(records);
+    summarize(task);
   }
 
   async function runTask(task) {
@@ -632,6 +744,10 @@
     if (latest) {
       setupTemplate(task, templateOf(latest));
       if (form.mode === "ids") task.productPath = await learnedProductPath(task.template);
+      const modeKey = `tkReplayMode:${endpointOf(task.template.url)}`;
+      const remembered = (await chrome.storage.local.get(modeKey))[modeKey];
+      if (remembered) { task.replayWorld = remembered.world; task.stripSign = !!remembered.strip; }
+      logEvent("info", task.timeRange ? `识别到时间筛选字段 ${task.timeRange.keys}（${fmtDay(task.timeRange.startMs)} ~ ${fmtDay(task.timeRange.endMs)}），总数超过 1 万条时将自动按时间分段。` : "请求中没有时间筛选字段：若总数超过 1 万条，需要先在页面上选择日期范围后查询。");
       const d = C.describeTemplate(task.template);
       logEvent("info", `模板：${d.method} ${d.endpoint}，分页=${d.pagination.kind}${d.pagination.pageKey ? `(${d.pagination.pageKey})` : ""}，每页参数=${d.pagination.sizeKey || "无"}，商品参数=${task.productPath ? task.productPath.join(".") : "未学习"}`);
     }

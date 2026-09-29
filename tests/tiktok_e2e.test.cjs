@@ -29,13 +29,16 @@ const REVIEWS = makeReviews();
 const LARGE = Number(process.env.TK_LARGE || 0);
 const BIG_ID = "1731892023085007777";
 if (LARGE) for (let i = 0; i < LARGE; i++) REVIEWS.push({ id: (7500000000000000000n + BigInt(i)).toString(), product: BIG_ID, sku: "1", day: 1 + (i % 28), images: i % 10 === 0 ? 1 : 0 });
+const BASE_TS = 1727740800;
+const createTime = r => BASE_TS + r.day * 86400 + (Number(BigInt(r.id) % 80000n));
 function filterReviews(body) {
+  const f = body.filter || {};
   return REVIEWS.filter(r => (!body.search_key || r.product === body.search_key || r.sku === body.search_key) &&
-    (!body.start_day || r.day >= body.start_day) && (!body.end_day || r.day <= body.end_day));
+    (!f.review_time_start || createTime(r) >= f.review_time_start) && (!f.review_time_end || createTime(r) <= f.review_time_end));
 }
 function reviewJson(r) {
   const images = Array.from({ length: r.images }, (_, i) => ({ thumb_url_list: [`https://p16-img.example.com/tos/${r.id}-${i}~tplv-thumb.jpeg?x-expires=1`], url_list: [`https://p16-img.example.com/tos/${r.id}-${i}~tplv-origin.jpeg?x-expires=1`, `https://p19-img.example.com/tos/${r.id}-${i}~tplv-origin.jpeg`] }));
-  return `{"main_review_id":${r.id},"star_level":${1 + (Number(BigInt(r.id) % 5n))},"review_text":"评价 ${r.id}","create_time":${1727740800 + r.day * 86400},"user_name":"buyer","order_id":"${r.id}1","product_info":{"product_id":"${r.product}","product_name":"商品 ${r.product.slice(-2)}","sku_id":"${r.sku}","sku_specification":"Red","main_image":{"url_list":["https://p16-img.example.com/product.jpeg"]}},"review_images":${JSON.stringify(images)},"reply_count":0}`;
+  return `{"main_review_id":${r.id},"star_level":${1 + (Number(BigInt(r.id) % 5n))},"review_text":"评价 ${r.id}","create_time":${createTime(r)},"user_name":"buyer","order_id":"${r.id}1","product_info":{"product_id":"${r.product}","product_name":"商品 ${r.product.slice(-2)}","sku_id":"${r.sku}","sku_specification":"Red","main_image":{"url_list":["https://p16-img.example.com/product.jpeg"]}},"review_images":${JSON.stringify(images)},"reply_count":0}`;
 }
 
 const PAGE_HTML = `<!doctype html><html><head><meta charset="utf-8"><title>Ratings</title></head><body>
@@ -57,7 +60,8 @@ function load() {
   xhr.open("POST", "/api/v1/product/rating/list?locale=zh-CN&shop_region=US");
   xhr.setRequestHeader("Content-Type", "application/json");
   xhr.onload = () => { const data = JSON.parse(xhr.responseText.replace(/:(\\d{16,})/g, ':"$1"')); render(data.data || { list: [], total: 0 }); };
-  xhr.send(JSON.stringify({ page: state.page, page_size: state.size, search_key: state.search, start_day: state.start, end_day: state.end, nonce: ++state.nonce }));
+  const filter = {}; if (state.start) filter.review_time_start = ${BASE_TS} + state.start * 86400; if (state.end) filter.review_time_end = ${BASE_TS} + state.end * 86400 + 86399;
+  xhr.send(JSON.stringify({ page: state.page, page_size: state.size, search_key: state.search, filter, nonce: ++state.nonce }));
 }
 function render(data) {
   document.getElementById("list").textContent = data.list.map(r => r.main_review_id).join(",");
@@ -101,7 +105,9 @@ async function handleApi(route) {
   }
   const page = Number(body.page) || 1;
   const all = filterReviews(body);
-  let list = all.slice((page - 1) * size, page * size);
+  // 模拟 TikTok：按页码最多只能取到第 10000 条，之后返回与最后一页相同的内容
+  const clampedPage = Math.min(page, Math.ceil(10000 / size));
+  let list = all.slice((clampedPage - 1) * size, clampedPage * size);
   // 模拟 TikTok：中途某些页不足一页（隐藏的评论仍计入总数）
   if (mode.shortPages && mode.shortPages.includes(page)) list = list.slice(2);
   const text = `{"code":0,"message":"success","data":{"list":[${list.map(reviewJson).join(",")}],"total":${all.length},"next_cursor":"${page}"}}`;
@@ -337,6 +343,25 @@ test("e2e: current filter, product list, UI fallback, image & export", { timeout
       assert.equal(result.driver, "页面点击");
       const ids = sheetRows(await exportWorkbook(panel), "评论").map(r => r["评论 ID"]);
       assert.deepEqual(ids, REVIEWS.slice(180).map(r => r.id));
+    });
+
+    await t.test("over 10,000 results: without a date filter it stops with guidance; with one it splits by time and gets everything", async () => {
+      globalThis.__serverMode = {};
+      const WIDE = "1731892023085008888";
+      if (!REVIEWS.some(r => r.product === WIDE)) for (let i = 0; i < 12000; i++) REVIEWS.push({ id: (7600000000000000000n + BigInt(i)).toString(), product: WIDE, sku: "2", day: 1 + (i % 28), images: 0 });
+      // 没有日期筛选：超过 1 万条时给出指引并暂停
+      await seller.fill("#kw", ""); await seller.fill("#startDay", ""); await seller.fill("#endDay", ""); await seller.click("#query"); await seller.waitForTimeout(500);
+      await fillForm(panel, { mode: "ids", ids: WIDE, pageSize: 50, batchSize: 1000 });
+      let result = await runAndWait(panel, 300000);
+      assert.match(result.error, /1 万条[\s\S]*日期范围/);
+      // 在页面上选择日期范围后新建任务：自动按时间分段
+      await seller.fill("#startDay", "1"); await seller.fill("#endDay", "28"); await seller.click("#query"); await seller.waitForTimeout(500);
+      await fillForm(panel, { mode: "ids", ids: WIDE, pageSize: 50, batchSize: 1000 });
+      result = await runAndWait(panel, 600000);
+      assert.equal(result.error, "", result.error);
+      assert.equal(Number(result.rows), 12000);
+      const ids = sheetRows(await exportWorkbook(panel), "评论").map(r => r["评论 ID"]);
+      assert.equal(new Set(ids).size, 12000);
     });
 
     await t.test("the seller page was never reloaded by the extension", async () => {

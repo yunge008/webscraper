@@ -364,6 +364,11 @@
       if (Array.isArray(current)) setPath(tree, options.productPath, [typed(current[0] === undefined ? "" : current[0], options.productId)]);
       else setPath(tree, options.productPath, typed(current, options.productId));
     }
+    if (options.timeRange) {
+      const r = options.timeRange;
+      setPath(tree, r.startPath, typed(getPath(tree, r.startPath), formatTimeValue(r.startMs, r.info)));
+      setPath(tree, r.endPath, typed(getPath(tree, r.endPath), formatTimeValue(r.endMs, r.info)));
+    }
     const out = serialize(tree, template.url, { stripSign: options.stripSign });
     const headers = {};
     for (const [name, value] of Object.entries(template.headers || {})) {
@@ -373,6 +378,50 @@
     return { transport: template.transport || "xhr", method: tree.method, url: out.url, body: tree.method === "GET" || tree.method === "HEAD" ? null : out.body, headers };
   }
 
+  // ---------- 时间范围（用于按时间分段，突破接口 1 万条的翻页上限） ----------
+  function parseTimeValue(value) {
+    const v = leafValue(value);
+    const text = String(v == null ? "" : v).trim();
+    if (/^\d{10}$/.test(text)) { const n = Number(text); if (n > 1.2e9 && n < 2.3e9) return { ms: n * 1000, unit: "s" }; }
+    if (/^\d{13}$/.test(text)) { const n = Number(text); if (n > 1.2e12 && n < 2.3e12) return { ms: n, unit: "ms" }; }
+    const m = text.match(/^(\d{4})([-/])(\d{1,2})\2(\d{1,2})(?:[ T](\d{1,2}):(\d{2})(?::(\d{2}))?)?$/);
+    if (m) {
+      const d = new Date(Number(m[1]), Number(m[3]) - 1, Number(m[4]), Number(m[5] || 0), Number(m[6] || 0), Number(m[7] || 0));
+      return { ms: d.getTime(), unit: m[5] ? "datetime" : "date", sep: m[2], seconds: m[7] !== undefined };
+    }
+    return null;
+  }
+  function formatTimeValue(ms, info) {
+    if (info.unit === "s") return Math.floor(ms / 1000);
+    if (info.unit === "ms") return Math.floor(ms);
+    const d = new Date(ms); const p2 = n => String(n).padStart(2, "0"); const sep = info.sep || "-";
+    const date = `${d.getFullYear()}${sep}${p2(d.getMonth() + 1)}${sep}${p2(d.getDate())}`;
+    return info.unit === "date" ? date : `${date} ${p2(d.getHours())}:${p2(d.getMinutes())}${info.seconds === false ? "" : `:${p2(d.getSeconds())}`}`;
+  }
+  const START_KEY = /start|begin|from|since|gte|min|lower/i;
+  const END_KEY = /end|to$|until|lte|max|upper/i;
+  const TIME_KEY = /time|date|day|period|range|create|ctime/i;
+  function findTimeRange(req) {
+    const all = leaves(parseRequest(req));
+    // 1) 形如 time_range: [start, end]
+    for (const leaf of all) {
+      if (!leaf.array || leaf.value.length !== 2 || !TIME_KEY.test(leaf.key)) continue;
+      const a = parseTimeValue(leaf.value[0]), b = parseTimeValue(leaf.value[1]);
+      if (a && b && a.unit === b.unit && a.ms <= b.ms) return { startPath: leaf.path.concat(0), endPath: leaf.path.concat(1), startMs: a.ms, endMs: b.ms, info: a, keys: `${leaf.key}[0..1]` };
+    }
+    // 2) 成对的 start / end 字段
+    const timed = all.filter(leaf => !leaf.array).map(leaf => ({ leaf, t: parseTimeValue(leaf.value), ctx: leaf.path.filter(p => typeof p === "string").join(".") })).filter(x => x.t);
+    const starts = timed.filter(x => START_KEY.test(x.leaf.key) && (TIME_KEY.test(x.ctx) || TIME_KEY.test(x.leaf.key)));
+    for (const s of starts) {
+      const parent = JSON.stringify(s.leaf.path.slice(0, -1));
+      const ends = timed.filter(x => x !== s && END_KEY.test(x.leaf.key) && x.t.unit === s.t.unit && x.t.ms >= s.t.ms);
+      const e = ends.find(x => JSON.stringify(x.leaf.path.slice(0, -1)) === parent && x.leaf.key.replace(END_KEY, "") === s.leaf.key.replace(START_KEY, "")) ||
+        ends.find(x => JSON.stringify(x.leaf.path.slice(0, -1)) === parent) || (ends.length === 1 ? ends[0] : null);
+      if (e) return { startPath: s.leaf.path, endPath: e.leaf.path, startMs: s.t.ms, endMs: e.t.ms, info: s.t, keys: `${s.leaf.key} / ${e.leaf.key}` };
+    }
+    return null;
+  }
+
   function describeTemplate(req, context) {
     const { pagination, leaves: all } = analyzeTemplate(req, context);
     let endpoint = "";
@@ -380,6 +429,7 @@
     return {
       endpoint, method: req.method, transport: req.transport,
       params: all.map(leaf => `${leaf.path[0] === "q" ? "query" : "body"}:${leaf.path.filter(p => typeof p === "string" && p !== "q" && p !== "b" && p !== "v").join(".") || leaf.key}`).slice(0, 60),
+      timeRange: (() => { const r = findTimeRange(req); return r ? { keys: r.keys, unit: r.info.unit } : null; })(),
       pagination: { kind: pagination.kind || "未识别", pageKey: pagination.pagePath ? pagination.pagePath.join(".") : "", pageBase: pagination.pageBase, pageSize: pagination.pageSize, sizeKey: pagination.sizePath ? pagination.sizePath.join(".") : "", cursorKey: pagination.cursorPath ? pagination.cursorPath.join(".") : "", offsetKey: pagination.offsetPath ? pagination.offsetPath.join(".") : "" }
     };
   }
@@ -428,7 +478,7 @@
   const api = {
     parseJson, stringifyJson, findReviewPayload, looksLikeReview, apiError, extractImages, flattenReview, formatReviewTime,
     rowKey, rowMatchesProduct, payloadSignature, parseRequest, analyzeTemplate, findValuePaths, hasPath, pathKey, buildRequest,
-    describeTemplate, shape, exportAoa, OUTPUT_COLUMNS, TEXT_COLUMNS
+    describeTemplate, shape, exportAoa, OUTPUT_COLUMNS, TEXT_COLUMNS, findTimeRange, parseTimeValue, formatTimeValue
   };
   root.TKCore = api;
   if (typeof module === "object" && module.exports) module.exports = api;
