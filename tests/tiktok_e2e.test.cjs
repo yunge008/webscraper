@@ -362,6 +362,7 @@ test("e2e: current filter, product list, UI fallback, image & export", { timeout
       assert.equal(Number(result.rows), 12000);
       const ids = sheetRows(await exportWorkbook(panel), "评论").map(r => r["评论 ID"]);
       assert.equal(new Set(ids).size, 12000);
+      for (let i = REVIEWS.length - 1; i >= 0; i--) if (REVIEWS[i].product === WIDE) REVIEWS.splice(i, 1);
     });
 
     await t.test("the seller page was never reloaded by the extension", async () => {
