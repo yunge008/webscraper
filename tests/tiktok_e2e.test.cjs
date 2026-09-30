@@ -107,6 +107,11 @@ async function handleApi(route) {
     return route.fulfill({ status: 200, contentType: "application/json", body: `{"code":0,"data":{"list":[],"total":${filterReviews(body).length}}}` });
   }
   const page = Number(body.page) || 1;
+  // 模拟接口在某页持续异常若干次（例如页面长时间运行后签名失效），需要刷新页面后才恢复
+  if (mode.brokenPage === page && (globalThis.__brokenLeft || 0) > 0) {
+    globalThis.__brokenLeft--;
+    return route.fulfill({ status: 200, contentType: "application/json", body: '{"code":0,"message":"success","data":{}}' });
+  }
   const all = filterReviews(body);
   // 模拟 TikTok：按页码最多只能取到第 10000 条，之后返回与最后一页相同的内容
   const clampedPage = Math.min(page, Math.ceil(10000 / size));
@@ -179,6 +184,7 @@ async function fillForm(panel, values) {
   await panel.fill("#delayMs", "0");
   await panel.selectOption("#driver", values.driver || "auto");
   await panel.setChecked("#reloadEachBatch", !!values.reload);
+  await panel.setChecked("#autoResume", values.autoResume !== false);
 }
 
 test("e2e: current filter, product list, UI fallback, image & export", { timeout: 600000, skip: !chromePath && "Chromium not found" }, async t => {
@@ -410,6 +416,30 @@ test("e2e: current filter, product list, UI fallback, image & export", { timeout
       const expected = REVIEWS.filter(r => r.day >= 5 && r.day <= 20).length;
       assert.equal(Number(result.rows), expected);
       assert.ok(seller.__loads - loadsBefore >= 2, `page reloaded ${seller.__loads - loadsBefore} times`);
+    });
+
+    await t.test("a page that keeps failing: without auto-resume it stops; with it, waits, reloads and finishes", async () => {
+      globalThis.__serverMode = { brokenPage: 3 };
+      await seller.fill("#kw", ""); await seller.fill("#startDay", "5"); await seller.fill("#endDay", "20"); await seller.click("#query"); await seller.waitForTimeout(500);
+      const expected = REVIEWS.filter(r => r.day >= 5 && r.day <= 20).length;
+      globalThis.__brokenLeft = 100;
+      await fillForm(panel, { mode: "current", pageSize: 20, batchSize: 1000, autoResume: false });
+      let result = await runAndWait(panel, 120000);
+      assert.match(result.error, /没有评论列表/);
+      globalThis.__brokenLeft = 4; // 页内重试 + 刷新后重试都失败，需要自动恢复一次
+      // 上一个任务刷新过评价页，页面上的筛选已重置：重新设置后再建任务
+      await seller.fill("#kw", ""); await seller.fill("#startDay", "5"); await seller.fill("#endDay", "20"); await seller.click("#query"); await seller.waitForTimeout(500);
+      const loadsBefore = seller.__loads;
+      await fillForm(panel, { mode: "current", pageSize: 20, batchSize: 1000 });
+      const started = Date.now();
+      result = await runAndWait(panel, 180000);
+      assert.equal(result.error, "", result.error);
+      assert.equal(globalThis.__brokenLeft, 0);
+      assert.ok(Date.now() - started >= 15000, "waited before auto-resuming");
+      assert.equal(Number(result.rows), expected);
+      assert.ok(seller.__loads - loadsBefore >= 2, `page reloaded ${seller.__loads - loadsBefore} times`);
+      const log = await panel.evaluate(() => document.getElementById("status").textContent);
+      assert.match(log, /完成/);
     });
 
     await t.test("review images: one ZIP archive, and Excel with embedded thumbnails", async () => {

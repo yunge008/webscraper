@@ -10,7 +10,7 @@
   const store = new window.TKStore();
   const $ = id => document.getElementById(id);
   const els = {};
-  for (const id of ["version", "pageStatus", "errorBanner", "idsBox", "productIds", "idFile", "idCount", "startPage", "endPage", "pageSize", "batchSize", "delayMs", "driver", "reloadEachBatch", "createTask", "pauseTask", "resumeTask", "statTotal", "statRows", "statImages", "statDriver", "progress", "status", "taskSelect", "taskInfo", "exportXlsx", "exportXlsxImages", "downloadImages", "deleteTask", "rowCount", "previewHead", "previewBody"]) els[id] = $(id);
+  for (const id of ["version", "pageStatus", "errorBanner", "idsBox", "productIds", "idFile", "idCount", "startPage", "endPage", "pageSize", "batchSize", "delayMs", "driver", "reloadEachBatch", "autoResume", "createTask", "pauseTask", "resumeTask", "statTotal", "statRows", "statImages", "statDriver", "progress", "status", "taskSelect", "taskInfo", "exportXlsx", "exportXlsxImages", "downloadImages", "deleteTask", "rowCount", "previewHead", "previewBody"]) els[id] = $(id);
   const VERSION = chrome.runtime.getManifest().version;
   const FORM_KEY = "tkReviewForm";
   const PREVIEW_COLUMNS = C.OUTPUT_COLUMNS.filter(([key]) => key !== "review_image_urls");
@@ -675,13 +675,84 @@
     summarize(task);
   }
 
+  // 出错后自动恢复：按固定间隔等待 → 刷新评价页 → 从断点继续（相当于手动“刷新网页 + 点继续”）。
+  // 每次有新数据保存后重试次数清零；连续失败次数用完、或是重试也无法解决的错误，才停下等人工处理。
+  const AUTO_RESUME_WAITS = [15, 30, 60, 120, 300, 600];
+  const PERMANENT_ERROR = /1 万条|大多不属于|本地保存失败|仅接口直连”|任务已完成/;
+  function autoResumeOn(task) { return task.config.autoResume !== false; }
+  function prepareResume(task) {
+    for (const item of task.items) {
+      if (item.status === "error") { item.status = "pending"; item.error = ""; }
+      if (item.status === "done" && itemRemaining(task, item)) item.status = "pending"; // 旧版本中途误判结束的任务
+    }
+    task.index = task.items.findIndex(i => i.status !== "done" && i.status !== "empty");
+  }
+  async function countdown(seconds, text) {
+    for (let left = seconds; left > 0; left--) {
+      if (pauseRequested) throw kindError("paused", "已暂停");
+      els.status.textContent = `${text}（${left} 秒后自动刷新评价页并继续；点“暂停”可取消）`;
+      await sleep(1000);
+    }
+  }
+  // 自动恢复前把评价页恢复到可用状态：标签被关了就重新打开，跳到别的页面就回到评价页，否则刷新。
+  async function recoverTab(task, reason) {
+    let tab = null;
+    try { tab = tabId ? await chrome.tabs.get(tabId) : null; } catch (_) { tab = null; }
+    if (!tab) {
+      try { tab = await findRatingTab(); }
+      catch (error) {
+        if (!task.pageUrl) throw error;
+        tab = await chrome.tabs.create({ url: task.pageUrl, active: false });
+        logEvent("info", "评价页标签已关闭，已重新打开评价页。");
+      }
+      tabId = tab.id;
+    } else if (!isRatingUrl(tab.url || "") && task.pageUrl) {
+      await chrome.tabs.update(tabId, { url: task.pageUrl });
+      logEvent("info", `评价页已跳转到 ${sanitize(tab.url)}，已重新打开评价页。`);
+    }
+    await reloadTab(reason);
+  }
   async function runTask(task) {
     running = task; pauseRequested = false; busy = true; controls();
+    let failures = 0, lastRows = task.rowCount || 0;
+    try {
+      while (true) {
+        const error = await runOnce(task);
+        if (!error) return;
+        if (!autoResumeOn(task) || PERMANENT_ERROR.test(error.message)) { showError(error); return; }
+        if ((task.rowCount || 0) > lastRows) { failures = 0; lastRows = task.rowCount || 0; }
+        if (failures >= AUTO_RESUME_WAITS.length) {
+          showError(new Error(`${error.message}（已自动刷新重试 ${failures} 次仍未恢复，请检查评价页是否正常、是否已登录，然后手动点“继续”）`));
+          return;
+        }
+        const wait = AUTO_RESUME_WAITS[failures++];
+        logEvent("warn", `自动恢复 ${failures}/${AUTO_RESUME_WAITS.length}：${error.message}`, error.stack);
+        try {
+          await countdown(wait, `出错：${error.message}｜已保存 ${task.rowCount || 0} 条｜自动恢复 ${failures}/${AUTO_RESUME_WAITS.length}`);
+          await recoverTab(task, `自动恢复 ${failures}/${AUTO_RESUME_WAITS.length}`);
+        } catch (recoverError) {
+          if (recoverError.kind === "paused") { task.status = "paused"; await store.putTask(task).catch(() => {}); setStatus(`已暂停：已保存 ${task.rowCount || 0} 条。点“继续”从断点接着采集。`); return; }
+          logEvent("warn", `自动恢复时刷新评价页失败：${recoverError.message}`);
+          // 刷新失败也算一次失败，下一轮 runOnce 会在打开页面时再次报错并进入下一次等待
+        }
+        prepareResume(task);
+      }
+    } finally {
+      running = null; busy = false; pauseRequested = false;
+      selectedId = task.id;
+      await refreshTaskList();
+      controls();
+    }
+  }
+  // 运行一轮；出错时返回错误（已保存状态），由 runTask 决定是否自动恢复。
+  async function runOnce(task) {
     clearError(); preview = []; renderPreview();
     task.status = "running"; task.lastError = "";
     await store.putTask(task);
+    let failure = null;
     try {
-      await useTab(false);
+      const tab = await useTab(false);
+      if (isRatingUrl(tab.url || "")) task.pageUrl = tab.url;
       const status = await ensureHook();
       logEvent("info", `页面监听：v${status.version}，已捕获 ${status.records} 条评论响应${status.lateInstall ? "（补注入）" : ""}`);
       for (let i = task.index || 0; i < task.items.length; i++) {
@@ -711,15 +782,13 @@
         task.status = "error"; task.lastError = error.message;
         const item = task.items[task.index || 0];
         if (item && item.status === "running") item.status = "pending";
-        showError(error);
+        els.status.textContent = `错误：${error.message}`;
+        failure = error;
       }
     } finally {
       await store.putTask(task).catch(() => {});
-      running = null; busy = false; pauseRequested = false;
-      selectedId = task.id;
-      await refreshTaskList();
-      controls();
     }
+    return failure;
   }
 
   // ---------------- 创建任务 ----------------
@@ -735,7 +804,8 @@
       batchSize: num(els.batchSize, 50, 1, 1000),
       delayMs: num(els.delayMs, 600, 0, 10000),
       driver: els.driver.value,
-      reloadEachBatch: els.reloadEachBatch.checked
+      reloadEachBatch: els.reloadEachBatch.checked,
+      autoResume: els.autoResume.checked
     };
   }
   async function createTask() {
@@ -770,7 +840,7 @@
       id: crypto.randomUUID(), createdAt: now, updatedAt: now,
       mode: form.mode,
       name: form.mode === "current" ? "当前筛选" : ids.length === 1 ? `商品 ${ids[0]}` : `商品列表 ${ids.length} 个`,
-      config: { startPage: form.startPage, endPage: form.endPage, pageSize: form.pageSize, batchSize: form.batchSize, delayMs: form.delayMs, driver: form.driver, reloadEachBatch: form.reloadEachBatch },
+      config: { startPage: form.startPage, endPage: form.endPage, pageSize: form.pageSize, batchSize: form.batchSize, delayMs: form.delayMs, driver: form.driver, reloadEachBatch: form.reloadEachBatch, autoResume: form.autoResume },
       template: null, pagination: null, productPath: null, stripSign: false, driverUsed: "",
       items: ids.map(id => ({ targetId: id, status: "pending", nextPage: form.startPage, cursor: "", total: null, totalPages: 0, rows: 0, pages: 0, error: "" })),
       index: 0, status: "paused", rowCount: 0, imageCount: 0, lastError: ""
@@ -955,7 +1025,7 @@
     els.exportXlsxImages.disabled = busy || !task || !task.imageCount;
     els.deleteTask.disabled = busy || !task;
     els.taskSelect.disabled = busy;
-    for (const el of document.querySelectorAll("input[name=mode], #productIds, #idFile, #startPage, #endPage, #pageSize, #batchSize, #delayMs, #driver, #reloadEachBatch")) el.disabled = busy;
+    for (const el of document.querySelectorAll("input[name=mode], #productIds, #idFile, #startPage, #endPage, #pageSize, #batchSize, #delayMs, #driver, #reloadEachBatch, #autoResume")) el.disabled = busy;
   }
   let selectedTask = null;
   function itemRemaining(task, item) {
@@ -1011,6 +1081,7 @@
     els.delayMs.value = form.delayMs ?? 600;
     els.driver.value = form.driver || "auto";
     els.reloadEachBatch.checked = form.reloadEachBatch !== false;
+    els.autoResume.checked = form.autoResume !== false;
   }
   function updateIdsUi() {
     const mode = document.querySelector("input[name=mode]:checked").value;
@@ -1032,12 +1103,8 @@
   els.resumeTask.addEventListener("click", action(async () => {
     const task = await store.getTask(selectedId);
     if (!task) throw new Error("请选择要继续的任务。");
-    for (const item of task.items) {
-      if (item.status === "error") { item.status = "pending"; item.error = ""; }
-      if (item.status === "done" && itemRemaining(task, item)) item.status = "pending"; // 旧版本中途误判结束的任务
-    }
+    prepareResume(task);
     if (task.status === "done" && task.items.every(i => i.status === "done" || i.status === "empty")) throw new Error("任务已完成。");
-    task.index = task.items.findIndex(i => i.status !== "done" && i.status !== "empty");
     await runTask(task);
   }));
   els.taskSelect.addEventListener("change", action(() => showTask(els.taskSelect.value)));
@@ -1060,7 +1127,7 @@
     await store.deleteTask(selectedId); selectedId = ""; preview = []; renderPreview(); await refreshTaskList(); setStatus("任务已删除。");
   }));
   for (const radio of document.querySelectorAll("input[name=mode]")) radio.addEventListener("change", () => { updateIdsUi(); saveForm(); });
-  for (const el of [els.productIds, els.startPage, els.endPage, els.pageSize, els.batchSize, els.delayMs, els.driver, els.reloadEachBatch]) el.addEventListener("change", saveForm);
+  for (const el of [els.productIds, els.startPage, els.endPage, els.pageSize, els.batchSize, els.delayMs, els.driver, els.reloadEachBatch, els.autoResume]) el.addEventListener("change", saveForm);
   els.productIds.addEventListener("input", () => { updateIdsUi(); saveForm(); });
   els.idFile.addEventListener("change", action(async () => {
     const file = els.idFile.files[0];

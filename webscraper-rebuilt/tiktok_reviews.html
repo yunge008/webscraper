@@ -46,6 +46,7 @@
 				</label>
 			</div>
 			<label class="tk-radio"><input id="reloadEachBatch" type="checkbox" checked> 每批结束后刷新评价页释放内存（仅接口直连；筛选条件已保存在任务中，不受影响）</label>
+			<label class="tk-radio"><input id="autoResume" type="checkbox" checked> 出错后自动刷新评价页并继续（等 15 秒、30 秒、1、2、5、10 分钟依次重试；有新数据即重新计数）</label>
 			<p class="tk-muted">终止页留空 = 采集全部页。“每页条数”仅在接口直连时生效，最大 200，服务器若有上限会自动按实际条数继续；页面点击模式沿用页面当前每页条数。</p>
 
 			<div class="tk-actions">
