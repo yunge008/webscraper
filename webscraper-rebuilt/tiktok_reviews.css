@@ -27,7 +27,16 @@ button:disabled { opacity: .45; cursor: not-allowed; }
 .tk-stats div { padding: 5px 7px; border: 1px solid #d8eef1; border-radius: 4px; background: #fbfeff; min-width: 0; }
 .tk-stat-label { display: block; color: #5c7a80; font-size: 11px; }
 .tk-stats strong { font-size: 14px; word-break: break-all; }
-.tk-progress-full { width: 100%; height: 10px; }
+.tk-progress { display: flex; gap: 2px; width: 100%; height: 10px; }
+.tk-progress-seg { flex: 1; min-width: 0; border-radius: 3px; background: #dcecef; overflow: hidden; }
+.tk-progress-seg > span { display: block; height: 100%; width: 0; background: #21bfce; transition: width .3s; }
+.tk-progress-seg.is-done > span { background: #14a3b1; }
+.tk-progress-seg.is-error > span { width: 100% !important; background: #e9a0a0; }
+.tk-progress-text { min-height: 18px; }
+.tk-settings { border: 1px solid #d8eef1; border-radius: 4px; background: #fbfeff; }
+.tk-settings > summary { cursor: pointer; padding: 6px 8px; font-weight: bold; color: #0d7480; list-style-position: inside; }
+.tk-settings > summary .tk-muted { font-weight: normal; margin-left: 4px; }
+.tk-settings-body { display: flex; flex-direction: column; gap: 8px; padding: 0 8px 8px; }
 .tk-status-row { font-size: 12px; line-height: 1.5; word-break: break-all; }
 .tk-error { margin: 0; padding: 8px 10px; border: 1px solid #f0a8a8; border-radius: 6px; background: #fff1f1; color: #a01818; font-size: 12px; line-height: 1.5; white-space: pre-wrap; word-break: break-all; }
 .tk-results { min-height: 200px; }

@@ -178,6 +178,7 @@ function sheetRows(book, name) { return XLSX.utils.sheet_to_json(book.Sheets[nam
 async function fillForm(panel, values) {
   await panel.check(`input[name=mode][value=${values.mode}]`);
   if (values.ids !== undefined) await panel.fill("#productIds", values.ids);
+  await panel.evaluate(() => { document.getElementById("settingsBox").open = true; });
   await panel.fill("#startPage", String(values.startPage || 1));
   await panel.fill("#endPage", values.endPage ? String(values.endPage) : "");
   await panel.fill("#pageSize", String(values.pageSize || 50));
@@ -192,6 +193,9 @@ test("e2e: current filter, product list, UI fallback, image & export", { timeout
   const { context, seller, panel, downloads } = await setup();
   try {
     await t.test("current filter keeps date range; API replay pages through all results", async () => {
+      const settings = await panel.evaluate(() => ({ open: document.getElementById("settingsBox").open, summary: document.getElementById("settingsSummary").textContent }));
+      assert.equal(settings.open, false, "settings are folded by default");
+      assert.match(settings.summary, /每页 50 条/);
       globalThis.__serverMode = {};
       // 用户在页面上设置日期并查询（扩展不刷新页面）
       await seller.fill("#startDay", "5"); await seller.fill("#endDay", "20");
@@ -230,6 +234,11 @@ test("e2e: current filter, product list, UI fallback, image & export", { timeout
       const result = await runAndWait(panel);
       assert.equal(result.error, "", result.error);
       assert.equal(Number(result.rows), 130 + 45);
+      // 进度条按 ID 分段（去重后 4 个），全部完成
+      const progress = await panel.evaluate(() => ({ segs: [...document.querySelectorAll("#progressBar .tk-progress-seg")].map(d => d.className), text: document.getElementById("progressText").textContent }));
+      assert.equal(progress.segs.length, 4);
+      assert.ok(progress.segs.every(c => /is-done/.test(c)), progress.segs.join(","));
+      assert.match(progress.text, /总进度 100%/);
       const book = await exportWorkbook(panel);
       const rows = sheetRows(book, "评论");
       assert.equal(rows.filter(r => r["采集商品 ID"] === P.A).length, 130);

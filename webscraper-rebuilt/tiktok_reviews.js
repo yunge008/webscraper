@@ -10,7 +10,7 @@
   const store = new window.TKStore();
   const $ = id => document.getElementById(id);
   const els = {};
-  for (const id of ["version", "pageStatus", "errorBanner", "idsBox", "productIds", "idFile", "idCount", "startPage", "endPage", "pageSize", "batchSize", "delayMs", "driver", "reloadEachBatch", "autoResume", "createTask", "pauseTask", "resumeTask", "statTotal", "statRows", "statImages", "statDriver", "progress", "status", "taskSelect", "taskInfo", "exportXlsx", "exportXlsxImages", "downloadImages", "deleteTask", "rowCount", "previewHead", "previewBody"]) els[id] = $(id);
+  for (const id of ["version", "pageStatus", "errorBanner", "idsBox", "productIds", "idFile", "idCount", "startPage", "endPage", "pageSize", "batchSize", "delayMs", "driver", "reloadEachBatch", "autoResume", "createTask", "pauseTask", "resumeTask", "statTotal", "statTotalLabel", "statRows", "statImages", "statDriver", "progressBar", "progressText", "settingsBox", "settingsSummary", "status", "taskSelect", "taskInfo", "exportXlsx", "exportXlsxImages", "downloadImages", "deleteTask", "rowCount", "previewHead", "previewBody"]) els[id] = $(id);
   const VERSION = chrome.runtime.getManifest().version;
   const FORM_KEY = "tkReviewForm";
   const PREVIEW_COLUMNS = C.OUTPUT_COLUMNS.filter(([key]) => key !== "review_image_urls");
@@ -380,18 +380,77 @@
     els.statRows.textContent = String(rows);
     els.statImages.textContent = String(images);
     els.statDriver.textContent = task.driverUsed === "api" ? "接口直连" : task.driverUsed === "ui" ? "页面点击" : "-";
-    const item = task.items[Math.min(task.index || 0, task.items.length - 1)];
+    const index = Math.min(task.index || 0, task.items.length - 1);
+    const item = task.items[index];
+    const multi = task.items.length > 1;
+    els.statTotalLabel.textContent = multi ? "当前 ID 总条数" : "接口总条数";
     els.statTotal.textContent = item && item.total != null ? String(item.total) : "-";
-    const doneItems = task.items.filter(i => i.status === "done" || i.status === "empty").length;
-    if (item && item.segments && task.items.length === 1) {
-      els.progress.max = Math.max(1, item.total || 1); els.progress.value = Math.min(task.rowCount || 0, item.total || 0);
-    } else if (task.items.length > 1) {
-      els.progress.max = task.items.length; els.progress.value = doneItems;
-    } else if (item) {
-      const totalPages = task.config.endPage ? Math.min(task.config.endPage, item.totalPages || task.config.endPage) : item.totalPages;
-      els.progress.max = Math.max(1, (totalPages || item.nextPage) - task.config.startPage + 1);
-      els.progress.value = Math.max(0, item.nextPage - task.config.startPage);
+    renderProgress(task, index);
+  }
+  // ---------------- 进度条与预计剩余时间 ----------------
+  // 多个 ID 时进度条分成等长的小段，每个 ID 一段；预计时间只按当前 ID 的采集速度估算。
+  const isFinished = it => it.status === "done" || it.status === "empty";
+  function itemFraction(task, item) {
+    if (isFinished(item)) return 1;
+    if (item.segments) return item.total ? Math.min(1, (item.rows || 0) / item.total) : 0;
+    const start = task.config.startPage;
+    const last = task.config.endPage ? Math.min(task.config.endPage, item.totalPages || task.config.endPage) : item.totalPages;
+    if (!last) return 0;
+    return Math.max(0, Math.min(1, (item.nextPage - start) / Math.max(1, last - start + 1)));
+  }
+  let etaState = null;
+  function fmtDuration(ms) {
+    const s = Math.max(1, Math.round(ms / 1000));
+    if (s < 60) return `${s} 秒`;
+    const m = Math.round(s / 60);
+    return m < 60 ? `${m} 分钟` : `${Math.floor(m / 60)} 小时 ${m % 60} 分钟`;
+  }
+  function estimate(task, index, fraction) {
+    const now = Date.now();
+    if (!running || running.id !== task.id) { etaState = null; return ""; }
+    // 换了 ID、刚开始或进度回退（重新采集）时重新计时
+    if (!etaState || etaState.taskId !== task.id || etaState.index !== index || fraction < etaState.lastFraction) {
+      etaState = { taskId: task.id, index, startTime: now, startFraction: fraction, lastFraction: fraction };
+      return "";
     }
+    etaState.lastFraction = fraction;
+    const done = fraction - etaState.startFraction, elapsed = now - etaState.startTime;
+    if (done <= 0 || elapsed < 5000 || fraction >= 1) return "";
+    return fmtDuration(elapsed / done * (1 - fraction));
+  }
+  function renderProgress(task, index) {
+    const items = task.items;
+    const segCount = items.length <= 50 ? items.length : 1;
+    if (els.progressBar.children.length !== segCount) {
+      els.progressBar.replaceChildren(...Array.from({ length: segCount }, () => { const d = document.createElement("div"); d.className = "tk-progress-seg"; d.appendChild(document.createElement("span")); return d; }));
+    }
+    const fractions = items.map(it => itemFraction(task, it));
+    const overall = fractions.reduce((a, b) => a + b, 0) / items.length;
+    if (segCount === items.length) {
+      items.forEach((it, i) => {
+        const seg = els.progressBar.children[i];
+        seg.className = `tk-progress-seg${isFinished(it) ? " is-done" : ""}${it.status === "error" ? " is-error" : ""}`;
+        seg.firstChild.style.width = `${Math.round(fractions[i] * 100)}%`;
+        seg.title = `${it.targetId || "当前筛选"}：${Math.round(fractions[i] * 100)}%${it.status === "error" ? "（失败）" : ""}`;
+      });
+    } else els.progressBar.firstChild.firstChild.style.width = `${Math.round(overall * 100)}%`;
+    els.progressBar.setAttribute("aria-valuenow", String(Math.round(overall * 100)));
+    const item = items[index];
+    const eta = item && !isFinished(item) ? estimate(task, index, fractions[index]) : "";
+    const parts = [`总进度 ${Math.round(overall * 100)}%`];
+    if (items.length > 1) parts.push(`第 ${Math.min(index + 1, items.length)} / ${items.length} 个 ID（完成 ${items.filter(isFinished).length} 个）`);
+    if (item && !isFinished(item) && running && running.id === task.id) {
+      parts.push(`${items.length > 1 ? "当前 ID " : ""}${Math.round(fractions[index] * 100)}%`);
+      if (eta) parts.push(`${items.length > 1 ? "当前 ID " : ""}预计剩余约 ${eta}`);
+      else if (fractions[index] < 1) parts.push("正在估算剩余时间…");
+    }
+    els.progressText.textContent = parts.join("｜");
+  }
+  // 设置面板折叠后，在标题上显示当前关键设置
+  function renderSettingsSummary() {
+    const f = readForm();
+    const driver = { auto: "自动", api: "仅接口", ui: "仅页面点击" }[f.driver] || f.driver;
+    els.settingsSummary.textContent = `第 ${f.startPage}~${f.endPage || "末"} 页 · 每页 ${f.pageSize} 条 · 每批 ${f.batchSize} 页 · 间隔 ${f.delayMs}ms · ${driver}${f.reloadEachBatch ? " · 批后刷新" : ""}${f.autoResume ? " · 自动恢复" : ""}`;
   }
   function pushPreview(records) {
     preview.push(...records);
@@ -1082,6 +1141,7 @@
     els.driver.value = form.driver || "auto";
     els.reloadEachBatch.checked = form.reloadEachBatch !== false;
     els.autoResume.checked = form.autoResume !== false;
+    renderSettingsSummary();
   }
   function updateIdsUi() {
     const mode = document.querySelector("input[name=mode]:checked").value;
@@ -1127,7 +1187,10 @@
     await store.deleteTask(selectedId); selectedId = ""; preview = []; renderPreview(); await refreshTaskList(); setStatus("任务已删除。");
   }));
   for (const radio of document.querySelectorAll("input[name=mode]")) radio.addEventListener("change", () => { updateIdsUi(); saveForm(); });
-  for (const el of [els.productIds, els.startPage, els.endPage, els.pageSize, els.batchSize, els.delayMs, els.driver, els.reloadEachBatch, els.autoResume]) el.addEventListener("change", saveForm);
+  for (const el of [els.productIds, els.startPage, els.endPage, els.pageSize, els.batchSize, els.delayMs, els.driver, els.reloadEachBatch, els.autoResume]) { el.addEventListener("change", saveForm); el.addEventListener("change", renderSettingsSummary); el.addEventListener("input", renderSettingsSummary); }
+  renderSettingsSummary();
+  try { els.settingsBox.open = localStorage.getItem("tkSettingsOpen") === "1"; } catch (_) {}
+  els.settingsBox.addEventListener("toggle", () => { try { localStorage.setItem("tkSettingsOpen", els.settingsBox.open ? "1" : "0"); } catch (_) {} });
   els.productIds.addEventListener("input", () => { updateIdsUi(); saveForm(); });
   els.idFile.addEventListener("change", action(async () => {
     const file = els.idFile.files[0];

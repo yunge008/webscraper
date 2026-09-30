@@ -31,6 +31,9 @@
 				<p class="tk-muted">ID 会自动保存，刷新页面或重开侧栏不会丢失。页面上的日期等其他筛选条件保持不变，只替换商品条件；返回的评论必须全部属于该 ID，否则停止，不会改抓全店评论。</p>
 			</div>
 
+			<details id="settingsBox" class="tk-settings">
+				<summary>采集设置 <span id="settingsSummary" class="tk-muted"></span></summary>
+				<div class="tk-settings-body">
 			<div class="tk-grid">
 				<label>起始页<input id="startPage" type="number" min="1" value="1"></label>
 				<label>终止页<input id="endPage" type="number" min="1" placeholder="全部"></label>
@@ -48,6 +51,8 @@
 			<label class="tk-radio"><input id="reloadEachBatch" type="checkbox" checked> 每批结束后刷新评价页释放内存（仅接口直连；筛选条件已保存在任务中，不受影响）</label>
 			<label class="tk-radio"><input id="autoResume" type="checkbox" checked> 出错后自动刷新评价页并继续（等 15 秒、30 秒、1、2、5、10 分钟依次重试；有新数据即重新计数）</label>
 			<p class="tk-muted">终止页留空 = 采集全部页。“每页条数”仅在接口直连时生效，最大 200，服务器若有上限会自动按实际条数继续；页面点击模式沿用页面当前每页条数。</p>
+				</div>
+			</details>
 
 			<div class="tk-actions">
 				<button id="createTask" type="button" class="tk-primary">创建并开始任务</button>
@@ -56,12 +61,13 @@
 			</div>
 
 			<div class="tk-stats">
-				<div><span class="tk-stat-label">接口总条数</span><strong id="statTotal">-</strong></div>
+				<div><span id="statTotalLabel" class="tk-stat-label">接口总条数</span><strong id="statTotal">-</strong></div>
 				<div><span class="tk-stat-label">已采集</span><strong id="statRows">0</strong></div>
 				<div><span class="tk-stat-label">评价图</span><strong id="statImages">0</strong></div>
 				<div><span class="tk-stat-label">翻页方式</span><strong id="statDriver">-</strong></div>
 			</div>
-			<progress id="progress" value="0" max="100" class="tk-progress-full"></progress>
+			<div id="progressBar" class="tk-progress" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"></div>
+			<p id="progressText" class="tk-progress-text tk-muted"></p>
 			<p id="status" class="tk-status-row" role="status" aria-live="polite">准备就绪。</p>
 		</section>
 
