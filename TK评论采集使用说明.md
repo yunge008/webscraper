@@ -1,6 +1,12 @@
 # TK 评论采集使用说明（v1.108.9，仅针对 Chrome）
 
-扩展目录：`webscraper-rebuilt`。支持的卖家后台：`*.tiktokshop.com`、`*.tiktokglobalshop.com`、`*.tiktokshopglobalselling.com`，以及墨西哥等使用 `seller-xx.tiktok.com` 域名的站点（v1.108.9 起）。侧栏有三个页签：**通用抓取 / TK评论抓取 / 诊断**。
+扩展目录：`webscraper-rebuilt`。支持的卖家后台：`*.tiktokshop.com`、`*.tiktokglobalshop.com`、`*.tiktokshopglobalselling.com`，以及墨西哥等使用 `seller-xx.tiktok.com` 域名的站点（v1.108.9 起）。已验证的评价页地址示例：
+
+- 美国（全球卖家）：`https://seller.us.tiktokshopglobalselling.com/product/rating?shop_region=US`
+- 日本（全球卖家）：`https://seller.tiktokshopglobalselling.com/product/rating?shop_region=JP`
+- 墨西哥：`https://seller-mx.tiktok.com/product/rating?shop_region=MX`
+- 菲律宾：`https://seller-ph.tiktok.com/product/rating?shop_region=PH`
+侧栏有三个页签：**通用抓取 / TK评论抓取 / 诊断**。
 
 ## 第一次使用
 
