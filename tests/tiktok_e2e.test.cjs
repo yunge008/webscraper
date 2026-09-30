@@ -113,7 +113,13 @@ async function handleApi(route) {
   let list = all.slice((clampedPage - 1) * size, clampedPage * size);
   // 模拟 TikTok：中途某些页不足一页（隐藏的评论仍计入总数）
   if (mode.shortPages && mode.shortPages.includes(page)) list = list.slice(2);
-  const text = `{"code":0,"message":"success","data":{"list":[${list.map(reviewJson).join(",")}],"total":${all.length},"next_cursor":"${page}"}}`;
+  // 模拟 TikTok：总数含已隐藏的评论，翻过实际数据后的页不再返回 list 字段
+  const total = all.length + (mode.hiddenInTotal || 0);
+  if (mode.hiddenInTotal && (page - 1) * size >= all.length && page > 1) {
+    globalThis.__apiCalls = (globalThis.__apiCalls || 0) + 1;
+    return route.fulfill({ status: 200, contentType: "application/json", body: `{"code":0,"message":"success","data":{"total":${total}}}` });
+  }
+  const text = `{"code":0,"message":"success","data":{"list":[${list.map(reviewJson).join(",")}],"total":${total},"next_cursor":"${page}"}}`;
   globalThis.__apiCalls = (globalThis.__apiCalls || 0) + 1;
   return route.fulfill({ status: 200, contentType: "application/json", body: text });
 }
@@ -362,6 +368,8 @@ test("e2e: current filter, product list, UI fallback, image & export", { timeout
       let result = await runAndWait(panel, 300000);
       assert.match(result.error, /1 万条[\s\S]*日期范围/);
       // 在页面上选择日期范围后新建任务：自动按时间分段
+      // 同时模拟总数含已隐藏评论：各时间段最后的页没有 list 字段，应视为该段采完而不是报错
+      globalThis.__serverMode = { hiddenInTotal: 60 };
       await seller.fill("#startDay", "1"); await seller.fill("#endDay", "28"); await seller.click("#query"); await seller.waitForTimeout(500);
       await fillForm(panel, { mode: "ids", ids: WIDE, pageSize: 50, batchSize: 1000 });
       result = await runAndWait(panel, 600000);

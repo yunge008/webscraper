@@ -187,7 +187,7 @@
     const err = C.apiError(json);
     if (err) throw kindError(/login|登录|auth|permission|权限/i.test(err) ? "fatal" : "api", err);
     const payload = C.findReviewPayload(json);
-    if (!payload) throw kindError("api", "接口响应中没有评论列表");
+    if (!payload) { const e = kindError("api", "接口响应中没有评论列表"); e.noList = true; throw e; }
     return payload;
   }
   // 在内容脚本（ISOLATED world）中直接请求：同源、带登录 Cookie，但不经过页面自身的 JS，
@@ -605,6 +605,11 @@
           return { payload, rows };
         } catch (error) {
           if (error.kind === "fatal" || error.kind === "paused") throw error;
+          // 时间段的总数包含已隐藏/删除的评论，实际条数更少：翻到最后一两页时接口可能不再返回评论列表字段，视为该时间段已采完
+          if (error.noList && page > 1 && (page >= (seg.pages || 0) - 1 || seg.lastShort)) {
+            logEvent("info", `时间段 ${fmtDay(seg.startMs)} ~ ${fmtDay(seg.endMs)} 第 ${page} 页已无评论（接口总数含已隐藏评论），该时间段采集完成。`);
+            return { payload: { list: [], total: null }, rows: [] };
+          }
           if (!ctx.reloaded) { ctx.reloaded = true; await reloadTab(`时间段请求异常（${error.message}）`); continue; }
           throw kindError("fatal", `时间段 ${fmtDay(seg.startMs)} ~ ${fmtDay(seg.endMs)} 第 ${page} 页多次重试仍失败：${error.message}。已保存的数据保留，点“继续”接着采集。`);
         }
@@ -659,7 +664,7 @@
   async function saveSegPage(task, item, itemIndex, seg, page, rows) {
     const backup = JSON.stringify({ item, rowCount: task.rowCount, imageCount: task.imageCount });
     const records = rows.map(row => ({ key: C.rowKey(row), targetId: item.targetId, page, order: itemIndex * 1e9 + (++item.rowSeq), row }));
-    seg.nextPage = page + 1; seg.lastSig = C.payloadSignature(rows);
+    seg.nextPage = page + 1; seg.lastSig = C.payloadSignature(rows); seg.lastShort = rows.length < (task.sizeUsed || task.pagination.pageSize || 50);
     item.pages = (item.pages || 0) + 1;
     try { item.rows = (item.rows || 0) + await store.savePage(task, records); }
     catch (error) {
