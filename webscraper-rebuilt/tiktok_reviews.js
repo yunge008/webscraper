@@ -55,7 +55,7 @@
   function isRatingUrl(url) {
     try {
       const u = new URL(url);
-      return u.protocol === "https:" && /(^|\.)(tiktokshop|tiktokshopglobalselling|tiktokglobalshop)\.com$/i.test(u.hostname) && /\/product\/(rating|review)/i.test(u.pathname);
+      return u.protocol === "https:" && (/(^|\.)(tiktokshop|tiktokshopglobalselling|tiktokglobalshop)\.com$/i.test(u.hostname) || /^seller(-[a-z0-9]+)?\.tiktok\.com$/i.test(u.hostname)) && /\/product\/(rating|review)/i.test(u.pathname);
     } catch (_) { return false; }
   }
   async function findRatingTab() {

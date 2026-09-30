@@ -9,7 +9,8 @@ const XLSX = require("../webscraper-rebuilt/sheetjs-0.20.3.min.js");
 
 const extensionPath = path.join(__dirname, "../webscraper-rebuilt");
 const chromePath = ["/opt/pw-browsers/chromium-1194/chrome-linux/chrome", process.env.CHROME_PATH].find(p => p && fs.existsSync(p));
-const SELLER = "https://seller-us.tiktokshop.com";
+// TK_SELLER=https://seller-mx.tiktok.com 可验证墨西哥等使用 tiktok.com 域名的站点
+const SELLER = process.env.TK_SELLER || "https://seller-us.tiktokshop.com";
 const RATING = `${SELLER}/product/rating?shop_region=US`;
 const P = { A: "1731892023085009910", B: "1731892023085009911", C: "1731892023085009912", D: "1731892023085009999" };
 
