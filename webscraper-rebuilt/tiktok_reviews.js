@@ -201,21 +201,38 @@
       .catch(error => ({ status: 0, text: "", error: String(error && error.message || error) }))
       .finally(() => clearTimeout(timer));
   }
+  // 刷新评价页。刷新后可能暂时显示错误页（网络波动或刷新过于频繁被拦），
+  // 此时等待后再刷新，最多 5 次；仍打不开才暂停任务（已保存的数据保留，可“继续”）。
   async function reloadTab(reason) {
-    setStatus(`${reason}：正在刷新评价页释放内存…`);
-    await chrome.tabs.reload(tabId);
-    const end = Date.now() + 60000;
-    await sleep(1000);
-    while (Date.now() < end) {
-      let tab;
-      try { tab = await chrome.tabs.get(tabId); } catch (_) { throw kindError("fatal", "评价页标签已关闭，任务已暂停。"); }
-      if (tab.status === "complete") break;
-      await sleep(500);
+    let lastError = null;
+    for (let attempt = 1; attempt <= 5; attempt++) {
+      if (pauseRequested) throw kindError("paused", "已暂停");
+      setStatus(attempt === 1 ? `${reason}：正在刷新评价页释放内存…` : `${reason}：评价页未正常打开，第 ${attempt}/5 次重新刷新…`);
+      try { await chrome.tabs.reload(tabId); }
+      catch (error) { if (/No tab/i.test(error.message)) throw kindError("fatal", "评价页标签已关闭，任务已暂停。"); lastError = error; }
+      const end = Date.now() + 60000;
+      await sleep(1000);
+      while (Date.now() < end) {
+        let tab;
+        try { tab = await chrome.tabs.get(tabId); } catch (_) { throw kindError("fatal", "评价页标签已关闭，任务已暂停。"); }
+        if (tab.status === "complete") break;
+        await sleep(500);
+      }
+      await pausableSleep(3000 + 2000 * (attempt - 1));
+      try {
+        const tab = await chrome.tabs.get(tabId);
+        if (!isRatingUrl(tab.url || "")) throw new Error(`页面跳转到了 ${sanitize(tab.url)}（可能需要重新登录）`);
+        await ensureHook();
+        if (running) running.pageReloaded = true;
+        logEvent("info", `已刷新评价页（${reason}）${attempt > 1 ? `，第 ${attempt} 次成功` : ""}。`);
+        return;
+      } catch (error) {
+        lastError = error;
+        logEvent("warn", `刷新后评价页未就绪（${error.message}），${10 * attempt} 秒后重试（${attempt}/5）。`);
+        await pausableSleep(10000 * attempt);
+      }
     }
-    await pausableSleep(3000);
-    await ensureHook();
-    if (running) running.pageReloaded = true;
-    logEvent("info", `已刷新评价页（${reason}）。`);
+    throw kindError("fatal", `评价页刷新后多次无法正常打开（${lastError ? lastError.message : "未知原因"}）。已采集的数据都已保存；请手动刷新评价页，确认页面正常显示（已登录）后点“继续”。`);
   }
   async function withRetry(fn) {
     let lastError;

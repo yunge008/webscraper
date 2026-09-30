@@ -128,7 +128,11 @@ async function setup() {
   await context.route(`${SELLER}/**`, route => {
     const url = new URL(route.request().url());
     if (url.pathname.startsWith("/api/")) return handleApi(route);
-    if (url.pathname.startsWith("/product/rating")) return route.fulfill({ status: 200, contentType: "text/html", body: PAGE_HTML });
+    if (url.pathname.startsWith("/product/rating")) {
+      // 模拟刷新后页面打不开（显示错误页）
+      if (globalThis.__failPageLoads > 0) { globalThis.__failPageLoads--; return route.abort("failed"); }
+      return route.fulfill({ status: 200, contentType: "text/html", body: PAGE_HTML });
+    }
     return route.fulfill({ status: 404, body: "" });
   });
   await context.route("https://p16-img.example.com/**", route => route.fulfill({ status: 200, contentType: "image/png", body: Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==", "base64") }));
@@ -391,7 +395,9 @@ test("e2e: current filter, product list, UI fallback, image & export", { timeout
       await seller.fill("#kw", ""); await seller.fill("#startDay", "5"); await seller.fill("#endDay", "20"); await seller.click("#query"); await seller.waitForTimeout(500);
       const loadsBefore = seller.__loads;
       await fillForm(panel, { mode: "current", pageSize: 20, batchSize: 2, reload: true });
-      const result = await runAndWait(panel, 180000);
+      globalThis.__failPageLoads = 1; // 第一次刷新后页面打不开，应自动重试
+      const result = await runAndWait(panel, 300000);
+      assert.equal(globalThis.__failPageLoads, 0, "the failing reload happened");
       assert.equal(result.error, "", result.error);
       const expected = REVIEWS.filter(r => r.day >= 5 && r.day <= 20).length;
       assert.equal(Number(result.rows), expected);
